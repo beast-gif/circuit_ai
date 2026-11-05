@@ -1,0 +1,48 @@
+# --- Secrets ---
+.env
+*.env
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- ngspice / PySpice output (Step 4) ---
+*.raw
+*.log
+spice_runs/
+
+# --- Rendered schematics for the confirmation step (Step 6) ---
+renders/
+*.tmp.png
+
+# --- Benchmark results (the problem set itself is kept) ---
+benchmark/results/
+
+# --- Uploaded question images (Phase 5) ---
+uploads/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

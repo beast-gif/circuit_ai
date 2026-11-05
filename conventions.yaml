@@ -1,0 +1,29 @@
+# Textbook assumptions used when the question does not state its own.
+# Both the solver and the explainer read this file, so answers stay consistent.
+# If a question gives a value (e.g. "take VT = 26 mV"), the question wins.
+
+semiconductor:
+  VT: 0.025          # thermal voltage (V). gm = IC / VT -> 1 mA gives 40 mA/V
+  VD_on: 0.7         # silicon diode drop (V), constant-drop model
+  VBE_on: 0.7        # BJT base-emitter drop in active mode (V)
+  VCE_sat: 0.2       # BJT saturation voltage (V)
+  beta: 100          # default current gain if not given
+  VA: null           # Early voltage; null = infinite (ro ignored)
+
+mosfet:
+  model: "square_law"   # ID = 0.5 * kn * (VGS - Vt)^2 in saturation
+  lambda: 0.0           # channel-length modulation; 0 = ro ignored
+
+opamp:
+  model: "ideal"     # infinite gain, infinite Rin, zero Rout -> virtual short
+  # used only when a question asks for non-ideal behaviour:
+  A0: 100000
+  GBW: 1.0e6         # Hz
+  slew_rate: 0.5e6   # V/s (0.5 V/us, 741-class)
+
+ac:
+  default_phase_deg: 0
+  frequency_unit: "Hz"   # answers report f in Hz and omega in rad/s
+
+output:
+  significant_figures: 4

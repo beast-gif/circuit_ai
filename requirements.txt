@@ -1,0 +1,13 @@
+# Step 1 needs only these four
+openai>=1.40
+pydantic>=2.6
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# Used from Step 3 onwards (installing now saves a second round)
+sympy>=1.12
+numpy>=1.26
+lcapy>=1.20
+schemdraw>=0.18
+langgraph>=0.2
+PySpice>=1.5   # also needs the ngspice system library (set up in Step 4)

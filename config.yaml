@@ -1,0 +1,25 @@
+# ---------------- LLM (Velona) ----------------
+llm:
+  base_url: "https://velona.in/v1"      # Velona OpenAI-compatible endpoint
+  api_key_env: "VELONA_API_KEY"          # read from .env, never hard-code the key
+
+  # One model per role. Check each id on your Velona dashboard and edit if it differs.
+  models:
+    image_parser: "anthropic/claude-sonnet-5"     # schematic image -> netlist (vision)
+    text_parser:  "deepseek/deepseek-v4-flash"    # text question -> netlist
+    classifier:   "openai/gpt-5-nano"             # labels the question type
+    explainer:    "deepseek/deepseek-v4-flash"    # step trace -> readable steps
+    conceptual:   "deepseek/deepseek-v4-pro"      # "why/how" theory questions
+
+  fallback_parser: "anthropic/claude-sonnet-5"    # used when text_parser fails validation twice
+
+  temperature: 0.0      # deterministic extraction; dropped automatically for models that reject it
+  max_retries: 2        # retries on rate-limit / timeout
+  timeout_s: 60
+
+# ---------------- Solver / verifier ----------------
+solver:
+  spice_tolerance_linear: 0.001     # 0.1 % for R/L/C/source circuits
+  spice_tolerance_nonlinear: 0.05   # 5 % for BJT/MOSFET (textbook approx vs SPICE models)
+
+conventions_file: "conventions.yaml"
