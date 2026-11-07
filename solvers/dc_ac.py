@@ -344,9 +344,9 @@ class _Job:
         m = MNA(self.nl.components, mode, overrides=ov)
 
         others = [c.id for c in self.indep if c.id != drv.id]
-        self.trace.add(f"Transfer function: set the input {drv.id} = 1"
-                       + (f", turn off {', '.join(others)}" if others else ""),
-                       "solve in the s-domain" if mode == "ac" else None)
+        self.trace.add("Transfer function: apply a unit input"
+                       + (" and solve in the s-domain" if mode == "ac" else ""),
+                       f"{drv.id} = 1" + (f",  {', '.join(others)} = 0 (turned off)" if others else ""))
         self._system_steps(m, level="key" if self._main is None else "full")
         m.solve()
         self._solution_step(m, level="full")
@@ -363,6 +363,8 @@ class _Job:
             ratio = f"V_{out} / {drv.id}"
         label = "H(s)" if H.has(s) else "H"
         self.trace.add("Transfer function", f"{label} = {ratio}", f"{label} = {pretty(H, self.sig)}")
+        # recorded even when H itself was not asked, so the verifier can check f0/Q/BW/poles/fc against it
+        self.res.symbolic.setdefault(f"H({out},{inp})", str(H))
         self._transfers[key] = (H, drv)
         return H, drv
 
@@ -373,7 +375,8 @@ class _Job:
         m = self.main()
         if b is None:
             text, _ = self._record(q, m.evaluate(m.V[a]), "V")
-            self.trace.add(f"Voltage at node {node_name(a)}", None, f"V_{a} = {text}")
+            # already shown by "Solve the equations", so only in the complete view
+            self.trace.add(f"Voltage at node {node_name(a)}", None, f"V_{a} = {text}", level="full")
             return
         expr = m.evaluate(m.V[a] - m.V[b])
         text, _ = self._record(q, expr, "V")
@@ -632,7 +635,9 @@ class _Job:
             self.res.answers[q] = ", ".join(fmt_si(x, "Hz", self.sig) for x in cuts)
             for i, x in enumerate(cuts[1:], 2):
                 self.res.numeric[f"{q}_{i}"] = x
-        self.trace.add("Cutoff frequency", None, f"fc = {self.res.answers[q]}")
+        # a first-order circuit already showed fc in the "single pole" step
+        self.trace.add("Cutoff frequency", None, f"fc = {self.res.answers[q]}",
+                       level="full" if den.degree() == 1 else "key")
 
     def _second_order(self) -> Optional[Dict[str, sp.Expr]]:
         """ω0, Q, BW from a second-order H(s); None if no usable transfer function. Cached."""

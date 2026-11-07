@@ -116,6 +116,105 @@ def consistency_checks() -> bool:
     e = consistency_errors(q_missing, Netlist(analysis="dc", query=["V(out)"], question=q_missing,
                                               components=comps))
     ok &= check("output across an inductor that is not in the netlist -> mismatch", bool(e), str(e))
+
+    # --- invented elements (benchmark th02 and ac04) ---------------------
+    q_n = ("A 12 V source in series with 4 kOhm connects to terminal a, and a 4 kOhm resistor connects a to "
+           "terminal b, which is the negative terminal of the source. Find the Norton current and resistance at a-b.")
+    base = [C("V1", "V", ["n1", "0"], "12"), C("R1", "R", ["n1", "a"], "4k"), C("R2", "R", ["a", "0"], "4k")]
+    shorted = Netlist(analysis="dc", query=["I(Vshort)", "Rth(a,0)"], question=q_n,
+                      components=base + [C("Vshort", "V", ["a", "0"], "0")])
+    e = consistency_errors(q_n, shorted)
+    ok &= check("th02: invented 0 V short -> rejected", any("0 V source" in x for x in e), str(e))
+    good = Netlist(analysis="dc", query=["Isc(a,0)", "Rn(a,0)"], question=q_n, components=base)
+    e = consistency_errors(q_n, good)
+    ok &= check("th02: Isc/Rn with no added parts -> consistent", not e, str(e))
+
+    q_z = "Find the magnitude of the impedance of a 100 Ohm resistor in series with a 1 uF capacitor at 1 kHz."
+    with_src = Netlist(analysis="ac", query=["Z(in,0)"], question=q_z, frequency="1k", components=[
+        C("V1", "V", ["in", "0"], ac="1"), C("R1", "R", ["in", "n1"], "100"), C("C1", "C", ["n1", "0"], "1u")])
+    e = consistency_errors(q_z, with_src)
+    ok &= check("ac04: source across the Z terminals -> rejected", any("directly across" in x for x in e), str(e))
+    no_src = Netlist(analysis="ac", query=["Z(in,0)"], question=q_z, frequency="1k", components=[
+        C("R1", "R", ["in", "n1"], "100"), C("C1", "C", ["n1", "0"], "1u")])
+    e = consistency_errors(q_z, no_src)
+    ok &= check("ac04: impedance with no source -> consistent", not e, str(e))
+
+    q_rc = "An RC low-pass filter has R = 1 kOhm and C = 1 uF. Find Vout/Vin and the cutoff frequency."
+    filt = Netlist(analysis="ac", query=["H(out,in)", "fc"], question=q_rc, components=[
+        C("V1", "V", ["in", "0"], ac="1"), C("R1", "R", ["in", "out"], "1k"), C("C1", "C", ["out", "0"], "1u")])
+    e = consistency_errors(q_rc, filt)
+    ok &= check("filter: the allowed input source is not flagged", not e, str(e))
+
+    # --- loose ends (benchmark dep03) -------------------------------------
+    q_loop = ("A 5 V source in series with a 1 kOhm resistor forms a loop with current Ix. A current-controlled "
+              "current source pushes 10 times Ix into node y, and a 500 Ohm resistor connects y to ground. "
+              "Find the voltage at node y.")
+    tail = [C("F1", "F", ["0", "y"], "10", control="R1"), C("R2", "R", ["y", "0"], "500")]
+    loose = Netlist(analysis="dc", query=["V(y)"], question=q_loop,
+                    components=[C("V1", "V", ["n1", "0"], "5"), C("R1", "R", ["n1", "x"], "1k")] + tail)
+    e = consistency_errors(q_loop, loose)
+    ok &= check("dep03: R1 left hanging at node x -> rejected", any("Node x connects only to R1" in x for x in e), str(e))
+    closed = Netlist(analysis="dc", query=["V(y)"], question=q_loop,
+                     components=[C("V1", "V", ["n1", "0"], "5"), C("R1", "R", ["n1", "0"], "1k")] + tail)
+    e = consistency_errors(q_loop, closed)
+    ok &= check("dep03: closed loop -> consistent", not e, str(e))
+    thev = Netlist(analysis="dc", query=["Vth(b,0)", "Rth(b,0)"], question="Find the Thevenin equivalent at b.",
+                   components=[C("V1", "V", ["n1", "0"], "24"), C("R1", "R", ["n1", "a"], "2k"),
+                               C("R2", "R", ["a", "0"], "6k"), C("R3", "R", ["a", "b"], "1.5k")])
+    e = consistency_errors(thev.question, thev)
+    ok &= check("open Thevenin terminal that is measured -> allowed", not e, str(e))
+
+    # --- "voltage across the resistor" (benchmark ac03) --------------------
+    q_vr = ("A series RC circuit with R = 1 kOhm and C = 1 uF is driven by a 5 V amplitude AC source at 100 Hz. "
+            "Find the magnitude of the voltage across the resistor.")
+    rc_parts = [C("V1", "V", ["in", "0"], ac="5"), C("R1", "R", ["in", "out"], "1k"), C("C1", "C", ["out", "0"], "1u")]
+    e = consistency_errors(q_vr, Netlist(analysis="ac", query=["V(out)"], question=q_vr, frequency="100",
+                                         components=rc_parts))
+    ok &= check("ac03: V(out) measures C, not the resistor -> rejected, suggests V(in,out)",
+                any("V(in,out)" in x for x in e), str(e))
+    e = consistency_errors(q_vr, Netlist(analysis="ac", query=["V(in,out)"], question=q_vr, frequency="100",
+                                         components=rc_parts))
+    ok &= check("ac03: V(in,out) -> consistent", not e, str(e))
+    swapped = [C("V1", "V", ["in", "0"], ac="5"), C("C1", "C", ["in", "out"], "1u"), C("R1", "R", ["out", "0"], "1k")]
+    e = consistency_errors(q_vr, Netlist(analysis="ac", query=["V(out)"], question=q_vr, frequency="100",
+                                         components=swapped))
+    ok &= check("ac03: C first, R to ground, V(out) -> consistent", not e, str(e))
+
+    # --- missing / oddly spelled "analysis" (benchmark dep04 attempt 1) ---
+    from parsing.text_parser import normalize
+    r = {"id": "R1", "type": "R", "nodes": ["in", "0"], "value": "1k"}
+    v_dc = {"id": "V1", "type": "V", "nodes": ["in", "0"], "value": "5"}
+    v_ac = {"id": "V1", "type": "V", "nodes": ["in", "0"], "ac": "1"}
+    cases = [
+        ({"components": [v_dc, r], "query": ["V(in)"]}, "dc"),
+        ({"components": [v_ac, r], "query": ["V(in)"]}, "ac"),
+        ({"components": [v_dc, r], "query": ["fc"]}, "ac"),
+        ({"components": [v_dc, r], "query": ["tau"]}, "transient"),
+        ({"components": [], "query": [], "analysis": "conceptual"}, "conceptual"),
+        ({"components": [v_dc, r], "query": ["V(in)"], "analysis": "Small-Signal"}, "small_signal"),
+        ({"components": [v_dc, r], "query": ["V(in)"], "analysis": "DC analysis"}, "dc"),
+    ]
+    for data, want in cases:
+        got = normalize(data)["analysis"]
+        ok &= check(f"analysis {data.get('analysis', '(missing)')!r} + {data['query']} -> {want}", got == want, got)
+
+    # --- the "conceptual" bug from the 120-run benchmark -------------------
+    empty = normalize({"components": [], "query": []})
+    ok &= check("no components + no analysis -> NOT guessed as conceptual (left missing -> retry)",
+                "analysis" not in empty, str(empty.get("analysis")))
+    wrapped = normalize({"netlist": {"analysis": "dc", "components": [v_dc, r], "query": ["V(in)"]}})
+    ok &= check('{"netlist": {...}} wrapper is unwrapped', len(wrapped["components"]) == 2
+                and wrapped["analysis"] == "dc", str(wrapped))
+    aliased = normalize({"analysis": "dc", "elements": [v_dc, r], "queries": ["V(in)"]})
+    ok &= check('"elements" / "queries" accepted as components / query',
+                len(aliased["components"]) == 2 and aliased["query"] == ["V(in)"], str(aliased))
+
+    q_num = "A 15 V source supplies R1 = 5 kOhm in series with R2 = 10 kOhm. Find the power delivered by the source."
+    e = consistency_errors(q_num, Netlist(analysis="conceptual", question=q_num))
+    ok &= check("numeric question labelled conceptual -> rejected", bool(e) and "15 V" in e[0], str(e))
+    q_th = "Why does negative feedback stabilize the gain of an amplifier?"
+    e = consistency_errors(q_th, Netlist(analysis="conceptual", question=q_th))
+    ok &= check("real theory question stays conceptual", not e, str(e))
     return ok
 
 

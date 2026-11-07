@@ -28,13 +28,26 @@ TYPES AND NODE ORDER (order matters)
   Q  BJT                 ["collector", "base", "emitter"],  "model": "NPN" or "PNP", params e.g. {"beta": 100}
   M  MOSFET              ["drain", "gate", "source"],       "model": "NMOS" or "PMOS", params e.g. {"kn": 0.002, "Vt": 1}
   OPAMP op-amp           ["out", "in+", "in-"],             "model": "ideal" unless the question says otherwise
-  E  VCVS                ["n+", "n-", "nc+", "nc-"], value = voltage gain
-  G  VCCS                ["n+", "n-", "nc+", "nc-"], value = transconductance
-  F  CCCS                ["n+", "n-"], "control": id of the source whose current controls it, value = gain
-  H  CCVS                ["n+", "n-"], "control": id of the controlling source, value = transresistance
+  E  VCVS                ["n+", "n-", "nc+", "nc-"], value = voltage gain.  V(n+) - V(n-) = gain * (V(nc+) - V(nc-))
+  G  VCCS                ["from", "to", "nc+", "nc-"], value = transconductance
+  F  CCCS                ["from", "to"], "control": id of the element whose current controls it, value = gain
+  H  CCVS                ["n+", "n-"], "control": id of the element whose current controls it, value = transresistance
+  G and F follow the SAME direction rule as I: the current is pushed OUT of the source into node "to".
+    "pushes / injects / delivers current into node b"          -> ["0", "b", ...]   ("from" = the other side)
+    "draws / sinks / pulls current out of node b to ground"     -> ["b", "0", ...]
+
+ONLY WHAT THE QUESTION DESCRIBES
+- Include ONLY the components the question describes. NEVER add test sources, 0 V "ammeter" sources, shorts,
+  loads or probes. Thevenin, Norton, impedance and resistance queries (Rth, Vth, Isc, In, Rn, Z) make the
+  solver turn sources off, short terminals and apply test sources by itself.
+- One exception: for a filter or transfer-function question that describes no source, add a single input
+  source {"id": "V1", "type": "V", "nodes": ["in", "0"], "ac": "1"}.
+- Questions asking only for an impedance or equivalent resistance get NO source at all.
 
 NODE RULES
 - Ground is ALWAYS the node "0". If the question shows no ground, use the negative terminal of the main source.
+  If there is no source (impedance / equivalent-resistance questions), the SECOND terminal named in the
+  question (b in "between a and b") is the ground node "0".
 - Use node names from the question when it names them (in, out, a, b, x, Vout -> "out").
   Otherwise use n1, n2, n3 ...
 - A wire joins points into ONE node: everything on the same wire gets the same node name.
@@ -43,8 +56,11 @@ NODE RULES
 - OUTPUT ACROSS AN ELEMENT: if the question says the output (Vout, Vo, output voltage) is taken across a
   component, that component MUST connect the output node to ground: "nodes": ["out", "0"].
   For series circuits, order the elements so this component is the one that touches ground.
-- "Voltage across R2" means a query that measures exactly R2's two nodes: V(x) if R2 is between x and "0",
-  otherwise V(x,y).
+- "Voltage across R2" (or "across the resistor" when there is only one) means a query that measures exactly
+  that element's two nodes: V(x) if it is between x and "0", otherwise V(x,y).
+- NO LOOSE ENDS: every node must connect to at least two elements, except a terminal that a query measures
+  (like Thevenin terminal "a"). "A source and a resistor form a loop" / "in series with" means the elements
+  form a closed path back to the source: V1 ["n1","0"] and R1 ["n1","0"], never R1 ["n1","x"] with x unused.
 
 VALUE RULES
 - Values are strings with SI prefixes and no units: "1k", "4.7u", "10m", "100n", "15p", "2.2Meg", "10".
@@ -67,7 +83,9 @@ QUERY FORMS (use exactly these)
   V(node)        voltage of node vs ground          V(a,b)       voltage between two nodes
   I(R1)          current through a component        P(R1)        power in a component
   Rth(a,b)       Thevenin resistance at terminals    Vth(a,b)     Thevenin voltage at terminals
-  Z(a,b)         impedance seen between two nodes    H(out,in)    transfer function Vout/Vin (in = node or source id)
+  Isc(a,b)       Norton / short-circuit current       Rn(a,b)      Norton resistance (same as Rth)
+  Z(a,b)         impedance or equivalent resistance seen between two nodes (all sources turned off)
+  H(out,in)      transfer function Vout/Vin (in = node or source id)
   bias(Q1)       DC operating point of a transistor
   Rin  Rout  gain  fc  f0  poles  zeros  tau  Qfactor  bandwidth
 
@@ -97,6 +115,28 @@ a 20 kOhm resistor goes from a to b, and b is the source's negative terminal.
    {"id": "R1", "type": "R", "nodes": ["n1", "a"], "value": "5k"},
    {"id": "R2", "type": "R", "nodes": ["a", "0"], "value": "20k"}],
  "query": ["Vth(a,0)", "Rth(a,0)"], "frequency": null,
+ "assumptions": ["terminal b is the ground node 0"], "missing_info": []}
+
+Question: A 9 V source in series with 3 kOhm feeds terminal a, and a 6 kOhm resistor connects a to terminal b,
+the source's negative terminal. Find the Norton equivalent at a-b.
+(No short or test source is added: Isc and Rn ask the solver to do that.)
+{"analysis": "dc",
+ "components": [
+   {"id": "V1", "type": "V", "nodes": ["n1", "0"], "value": "9"},
+   {"id": "R1", "type": "R", "nodes": ["n1", "a"], "value": "3k"},
+   {"id": "R2", "type": "R", "nodes": ["a", "0"], "value": "6k"}],
+ "query": ["Isc(a,0)", "Rn(a,0)"], "frequency": null,
+ "assumptions": ["terminal b is the ground node 0"], "missing_info": []}
+
+Question: Find the equivalent resistance between terminals a and b: R1 = 10 Ohm from a to node c, and
+R2 = 20 Ohm and R3 = 20 Ohm both from c to b.
+(No source in the question, so none is added; the second terminal b becomes ground.)
+{"analysis": "dc",
+ "components": [
+   {"id": "R1", "type": "R", "nodes": ["a", "c"], "value": "10"},
+   {"id": "R2", "type": "R", "nodes": ["c", "0"], "value": "20"},
+   {"id": "R3", "type": "R", "nodes": ["c", "0"], "value": "20"}],
+ "query": ["Z(a,0)"], "frequency": null,
  "assumptions": ["terminal b is the ground node 0"], "missing_info": []}
 
 Question: A series RLC circuit has R = 100 Ohm, L = 1 mH and C = 10 nF and is driven by a 1 V AC source.

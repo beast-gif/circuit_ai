@@ -6,7 +6,8 @@ Loop:
   2. normalise common LLM slips ("resistor" -> "R", "gnd" -> "0", numbers -> strings)
   3. schemas.Netlist checks each component, validator.validate checks the whole circuit
   4. consistency_errors() compares the netlist with phrases in the question
-     ("output taken across R", "voltage across R2") -- catches circuits that are valid but not the one asked
+     ("output taken across R", "voltage across R2") -- catches circuits that are valid but not the one asked --
+     and rejects elements the LLM invented to "measure" something (0 V shorts, a source across Z/Rth/Isc terminals)
   5. if anything fails, the exact errors go back to the LLM and it tries again
   6. after `max_attempts` failures with the cheap model, one last try with fallback_parser (Sonnet 5)
   7. if the only remaining problem is a consistency mismatch (the check is phrase-based, so it can
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,7 +25,7 @@ from pydantic import ValidationError
 
 from llm_client import LLMError, VelonaClient, extract_json
 from parsing.prompts import NOT_JSON_FEEDBACK, RETRY_FEEDBACK, TEXT_PARSER_SYSTEM, TEXT_PARSER_USER
-from schemas import Netlist
+from schemas import Netlist, parse_value
 from validator import ValidationReport, validate
 
 # LLM spelling -> (type, default model)
@@ -67,6 +69,7 @@ class ParseResult:
     model_used: str = ""
     errors: List[str] = field(default_factory=list)   # last errors if ok is False
     raw: Dict[str, Any] = field(default_factory=dict)  # last JSON from the model
+    history: List[Dict[str, Any]] = field(default_factory=list)  # why each failed attempt was rejected
 
 
 # ----------------------------------------------------------------------
@@ -90,7 +93,38 @@ def _norm_query(q: Any) -> str:
     return BARE_NAMES.get(s.lower(), s)
 
 
+_COMPONENT_KEYS = ("components", "elements", "parts", "netlist_components")
+_QUERY_KEYS = ("query", "queries", "find", "unknowns")
+
+
+def unwrap(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept common variations of the JSON shape instead of mistaking them for 'no circuit':
+    {"netlist": {...}} / {"circuit": {...}} wrappers, "elements" instead of "components",
+    "queries" instead of "query"."""
+    if not isinstance(data, dict):
+        return {}
+    if not any(isinstance(data.get(k), list) for k in _COMPONENT_KEYS):
+        nested = [v for v in data.values()
+                  if isinstance(v, dict) and any(isinstance(v.get(k), list) for k in _COMPONENT_KEYS)]
+        if len(nested) == 1:                     # keep top-level scalars (e.g. "analysis") the wrapper lacks
+            top = {k: v for k, v in data.items() if not isinstance(v, dict)}
+            data = {**top, **nested[0]}
+    data = dict(data)
+    if not isinstance(data.get("components"), list):
+        for k in _COMPONENT_KEYS[1:]:
+            if isinstance(data.get(k), list):
+                data["components"] = data.pop(k)
+                break
+    if "query" not in data:
+        for k in _QUERY_KEYS[1:]:
+            if k in data:
+                data["query"] = data.pop(k)
+                break
+    return data
+
+
 def normalize(data: Dict[str, Any]) -> Dict[str, Any]:
+    data = unwrap(data)
     out = dict(data)
     out.pop("missing_info", None)
 
@@ -135,7 +169,40 @@ def normalize(data: Dict[str, Any]) -> Dict[str, Any]:
     out["query"] = [_norm_query(x) for x in (q if isinstance(q, list) else [q])]
     out["frequency"] = _to_str(data.get("frequency"))
     out["assumptions"] = [str(a) for a in (data.get("assumptions") or [])]
+
+    # "analysis": tidy the spelling, or work it out when the LLM left it out (saves a whole retry)
+    a = str(out.get("analysis") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    a = a.removesuffix("_analysis")
+    inferred = infer_analysis(out)
+    if a in ANALYSES:
+        out["analysis"] = a
+    elif inferred:
+        out["analysis"] = inferred
+    else:
+        out.pop("analysis", None)        # nothing to infer from -> schema error -> the LLM retries
     return out
+
+
+ANALYSES = {"dc", "ac", "transient", "small_signal", "conceptual"}
+_AC_KINDS = {"fc", "f0", "poles", "zeros", "Qfactor", "bandwidth", "H", "gain"}
+
+
+def infer_analysis(data: Dict[str, Any]) -> Optional[str]:
+    """Analysis type from the rest of the netlist, used only when the LLM omitted it.
+    No components -> None (NOT "conceptual"): an empty or oddly shaped reply must be retried,
+    never silently turned into a theory question."""
+    comps = data.get("components") or []
+    if not comps:
+        return None
+    kinds = {re.match(r"^(\w+)", q).group(1) for q in data.get("query") or [] if re.match(r"^(\w+)", q)}
+    types = {str(c.get("type", "")) for c in comps}
+    if "tau" in kinds:
+        return "transient"
+    if types & {"Q", "M"} and kinds & {"Rin", "Rout", "gain"}:
+        return "small_signal"
+    if kinds & _AC_KINDS or data.get("frequency") or any(c.get("ac") not in (None, "") for c in comps):
+        return "ac"
+    return "dc"
 
 
 # ----------------------------------------------------------------------
@@ -147,9 +214,11 @@ _ELEMENT = r"(resistor|capacitor|inductor|[RCL]\d*)\b(?:\s+([RCL]\d+)\b)?"
 # "output (voltage) is taken across (the) (10 Ohm) resistor (R2)", "Vout across C1"
 _OUT_ACROSS = re.compile(r"\b(?:output|v_?out|v_?o)\b[^.;]*?\bacross\s+(?:the\s+)?" + _VALUE_WORDS + _ELEMENT,
                          re.IGNORECASE)
-# "voltage (drop) across (the) (resistor) R2"  -- explicit ids only
+# "voltage (drop) across (the) (1 kOhm) resistor (R2)" / "voltage across R2"
+#   group 1 = type word, group 2 = id after the word, group 3 = id alone
 _VOLT_ACROSS = re.compile(r"\bvoltage(?:\s+drop)?\s+across\s+(?:the\s+)?" + _VALUE_WORDS
-                          + r"(?:resistor\s+|capacitor\s+|inductor\s+)?([RCL]\d+)\b", re.IGNORECASE)
+                          + r"(?:(resistor|capacitor|inductor)\b(?:\s+([RCL]\d+)\b)?|([RCL]\d+)\b)",
+                          re.IGNORECASE)
 
 _WORD_TYPE = {"resistor": "R", "r": "R", "capacitor": "C", "c": "C", "inductor": "L", "l": "L"}
 _OUT_NODES = ("out", "vout", "Vout", "vo", "Vo", "o", "output")
@@ -183,9 +252,20 @@ def _candidates(nl: Netlist, word: str, explicit_id: Optional[str]) -> Tuple[str
     return desc, [c for c in nl.components if c.type.value == typ]
 
 
+_VALUE_IN_TEXT = re.compile(r"(?<![\w.])\d+(?:\.\d+)?\s*(?:meg|[kmuµnp])?\s*(?:ohms?|Ω|v|a|f|h|hz)\b",
+                            re.IGNORECASE)
+
+
 def consistency_errors(question: str, nl: Netlist) -> List[str]:
     """Check phrases in the question against the netlist. Returns problems as LLM feedback."""
-    if nl.analysis.value == "conceptual" or not question:
+    if not question:
+        return []
+    if nl.analysis.value == "conceptual":
+        # "A 12 V source ... R1 = 4 kOhm ... find" is a circuit problem, not theory
+        values = [m.group(0) for m in _VALUE_IN_TEXT.finditer(question)]
+        if len(values) >= 2:
+            return [f"The question gives circuit values ({', '.join(values[:4])}), so it is a numeric circuit "
+                    "problem, not a theory question. Return the full netlist: analysis, components and query."]
         return []
     errors: List[str] = []
 
@@ -213,15 +293,97 @@ def consistency_errors(question: str, nl: Netlist) -> List[str]:
             measured.append({m.group(1), m.group(2)})
     if measured:
         for m in _VOLT_ACROSS.finditer(question):
-            cid = m.group(1)[0].upper() + m.group(1)[1:]
-            comp = nl.get(cid)
+            word, explicit = m.group(1), (m.group(2) or m.group(3))
+            if explicit:
+                comp = nl.get(explicit[0].upper() + explicit[1:])
+                name = comp.id if comp else ""
+            else:                                   # "the resistor": only when there is exactly one
+                same = [c for c in nl.components if c.type.value == _WORD_TYPE[word.lower()]]
+                comp = same[0] if len(same) == 1 else None
+                name = f"the {word.lower()} ({comp.id})" if comp else ""
             if comp is None:
                 continue
             a, b = comp.nodes[0], comp.nodes[1]
             if set(comp.nodes[:2]) not in measured:
                 fix = f"V({a})" if b == "0" else f"V({b})" if a == "0" else f"V({a},{b})"
-                errors.append(f"The question asks for the voltage across {cid}, which connects {a} and {b}, "
+                errors.append(f"The question asks for the voltage across {name}, which connects {a} and {b}, "
                               f"but no query measures those two nodes. Use {fix}.")
+
+    errors += _dangling_errors(question, nl)
+    errors += _added_element_errors(question, nl)
+    return errors
+
+
+def _dangling_errors(question: str, nl: Netlist) -> List[str]:
+    """A node touched by only ONE element is an open end: no current can flow through that element.
+    Fine for a terminal being measured (Thevenin 'a'), almost always a parse mistake otherwise
+    (e.g. 'a source and resistor form a loop' parsed as R1 n1 x with x connected to nothing)."""
+    conn: Dict[str, List[str]] = defaultdict(list)
+    for c in nl.components:
+        t = c.type.value
+        skip = {2, 3} if t in ("E", "G") else ({1, 2} if t == "OPAMP" else set())   # sensing / input pins
+        for i, n in enumerate(c.nodes):
+            if i not in skip:
+                conn[n].append(c.id)
+
+    queried = set()
+    for q in nl.query:
+        m = re.match(r"^\w+\((.*)\)$", q)
+        if m:
+            queried |= {x.strip() for x in m.group(1).split(",")}
+    out = _output_node(nl)
+    if out:
+        queried.add(out)
+
+    errors = []
+    for n, ids in conn.items():
+        if n == "0" or len(ids) != 1 or n in queried:
+            continue
+        # the question itself names it as a terminal ("terminals a and b") -> leave it
+        if re.search(rf"\b(?:terminal|node|point)s?\s+(?:\w+\s+(?:and|to|-)\s+)?{re.escape(n)}\b", question, re.I):
+            continue
+        errors.append(f'Node {n} connects only to {ids[0]}, so no current can flow through {ids[0]} (an open end). '
+                      f'If {ids[0]} is part of a loop or series path, connect its other end to the rest of the '
+                      f'circuit (often ground "0").')
+    return errors
+
+
+_PORT_QUERY = re.compile(r"^(Z|Zth|Rth|Rn|Isc|In|Vth)\((\w+),(\w+)\)$")
+
+
+def _is_zero(raw: Optional[str]) -> bool:
+    if raw in (None, ""):
+        return True
+    try:
+        return parse_value(raw) == 0
+    except ValueError:
+        return False
+
+
+def _added_element_errors(question: str, nl: Netlist) -> List[str]:
+    """Catch elements the LLM invented to 'measure' something (they change the circuit)."""
+    errors: List[str] = []
+    q = question.lower()
+
+    # a 0 V voltage source is a short / ammeter the question never describes
+    if not re.search(r"\b0\s*v\b|\bzero[- ]volt|\bshort", q):
+        for c in nl.components:
+            if c.type.value == "V" and _is_zero(c.value) and _is_zero(c.ac):
+                errors.append(f"{c.id} is a 0 V source (a short) that the question does not describe. "
+                              "Remove it: use Isc(a,b) for a short-circuit current and I(X) for a current; "
+                              "the solver adds shorts and test sources itself.")
+
+    # a voltage source straight across the terminals being measured forces Z = 0 / Isc undefined
+    for qry in nl.query:
+        m = _PORT_QUERY.match(qry)
+        if not m or m.group(1) == "Vth":
+            continue
+        ends = {m.group(2), m.group(3)}
+        for c in nl.components:
+            if c.type.value == "V" and set(c.nodes[:2]) == ends:
+                errors.append(f"{c.id} is connected directly across the terminals of {qry}. With sources turned "
+                              f"off it becomes a short, so the answer would be 0. If the question does not "
+                              f"describe this source, remove it.")
     return errors
 
 
@@ -243,10 +405,15 @@ def _pydantic_errors(e: ValidationError, data: Dict[str, Any]) -> List[str]:
 
 # ----------------------------------------------------------------------
 def parse_text(question: str, client: Optional[VelonaClient] = None,
-               max_attempts: int = 2, use_fallback: bool = True) -> ParseResult:
+               max_attempts: int = 2, use_fallback: bool = True, hint: Optional[str] = None) -> ParseResult:
+    """hint: a correction from the user ("R2 is 2k, not 1k") or from the solver, used on a re-parse."""
     client = client or VelonaClient()
+    user = TEXT_PARSER_USER.format(question=question.strip())
+    if hint:
+        user += (f"\n\nA previous attempt at this circuit was wrong. Correction: {hint.strip()}\n"
+                 "Apply this correction.")
     base = [{"role": "system", "content": TEXT_PARSER_SYSTEM},
-            {"role": "user", "content": TEXT_PARSER_USER.format(question=question.strip())}]
+            {"role": "user", "content": user}]
 
     plan = [(client.model_for("text_parser"), max_attempts)]
     if use_fallback and client.fallback_parser != plan[0][0]:
@@ -258,6 +425,10 @@ def parse_text(question: str, client: Optional[VelonaClient] = None,
     missing: List[str] = []
     model = plan[0][0]
     best: Optional[tuple] = None     # valid netlist that only failed the consistency check
+    history: List[Dict[str, Any]] = []
+
+    def failed(stage: str, errs: List[str]) -> None:
+        history.append({"attempt": attempts, "model": model, "stage": stage, "errors": list(errs)})
 
     for model, n_tries in plan:
         messages = list(base)                 # each model starts fresh
@@ -267,11 +438,13 @@ def parse_text(question: str, client: Optional[VelonaClient] = None,
                 text = client.chat("text_parser", messages, json_mode=True, model=model)
             except LLMError as e:             # request itself failed
                 last_errors = [str(e)]
+                failed("request", last_errors)
                 continue
             try:
                 raw = extract_json(text)
             except LLMError as e:
                 last_errors = [str(e)]
+                failed("json", last_errors)
                 messages += [{"role": "assistant", "content": text},
                              {"role": "user", "content": NOT_JSON_FEEDBACK}]
                 continue
@@ -283,17 +456,19 @@ def parse_text(question: str, client: Optional[VelonaClient] = None,
             try:
                 nl = Netlist.model_validate(data)
             except ValidationError as e:
-                errs = _pydantic_errors(e, data)
+                errs, stage = _pydantic_errors(e, data), "schema"
             else:
                 report = validate(nl)
                 if report.ok:
-                    errs = consistency_errors(question, nl)
+                    errs, stage = consistency_errors(question, nl), "consistency"
                     if not errs:
-                        return ParseResult(True, nl, report, missing, attempts, model, [], raw)
-                    best = (nl, report, errs, list(missing), model, raw)
+                        return ParseResult(True, nl, report, missing, attempts, model, [], raw, history)
+                    if nl.analysis.value != "conceptual":    # a "theory" reply to a numeric question is never kept
+                        best = (nl, report, errs, list(missing), model, raw)
                 else:
-                    errs = report.errors
+                    errs, stage = report.errors, "validator"
 
+            failed(stage, errs)
             last_errors = errs
             messages += [{"role": "assistant", "content": json.dumps(raw)},
                          {"role": "user",
@@ -302,5 +477,5 @@ def parse_text(question: str, client: Optional[VelonaClient] = None,
     if best is not None:
         nl, report, errs, missing, model, raw = best
         report.warnings += [f"Possible mismatch with the question: {e}" for e in errs]
-        return ParseResult(True, nl, report, missing, attempts, model, [], raw)
-    return ParseResult(False, None, None, missing, attempts, model, last_errors, raw)
+        return ParseResult(True, nl, report, missing, attempts, model, [], raw, history)
+    return ParseResult(False, None, None, missing, attempts, model, last_errors, raw, history)
