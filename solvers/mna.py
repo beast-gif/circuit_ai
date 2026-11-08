@@ -21,9 +21,19 @@ Sign conventions (identical to SPICE, so the ngspice check in Step 4 lines up):
                                     (a source delivering power has negative I_X)
     I source ["a", "b"]           : current flows from a through the source into b
     G / F ["n+", "n-", ...]       : controlled current flows from n+ through the source to n-
+
+Ideal op-amp ["out", "in+", "in-"]  (the "nullor" model, Phase 2):
+    - no current enters in+ or in-            -> the inputs add NOTHING to KCL
+    - the output supplies whatever current is needed
+                                              -> one unknown I_U (flows from out into the op-amp,
+                                                 i.e. the op-amp DELIVERS -I_U into node out)
+    - virtual short                           -> one equation  V(in-) = V(in+)
+    One unknown + one equation, so the system stays square. Example, inverting amp
+    (Rin = 1k, Rf = 10k, Vin = 1): V- = V+ = 0, KCL at in-: (0 - 1)/1k + (0 - Vout)/10k = 0 -> Vout = -10.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -34,12 +44,12 @@ from solvers.base import NotSupportedError, SolverError, pretty
 
 s = sp.Symbol("s")
 GROUND = "0"
-LINEAR_TYPES = {"R", "C", "L", "V", "I", "E", "G", "F", "H"}
+LINEAR_TYPES = {"R", "C", "L", "V", "I", "E", "G", "F", "H", "OPAMP"}
 INDEPENDENT = {"V", "I"}
 CONTROLLED = {"E", "G", "F", "H"}
 POSITIVE_TYPES = {"R", "C", "L"}
-LATER_PHASE = {"OPAMP": "op-amps (Phase 2)", "Q": "BJTs (Phase 3)",
-               "M": "MOSFETs (Phase 3)", "D": "diodes (Phase 3)"}
+BRANCH_TYPES = {"V", "E", "H", "OPAMP"}           # elements that get their own current unknown
+LATER_PHASE = {"Q": "BJTs (Phase 3)", "M": "MOSFETs (Phase 3)", "D": "diodes (Phase 3)"}
 
 
 @dataclass
@@ -93,21 +103,83 @@ def tidy(e) -> sp.Expr:
 
 
 # ----------------------------------------------------------------------
+# Non-ideal op-amp parameters (Phase 2, step 3)
+# ----------------------------------------------------------------------
+_IDEAL_NAMES = {"", "ideal"}
+_GENERIC_NONIDEAL = {"nonideal", "non-ideal", "non_ideal", "real", "practical", "finite", "finite_gain"}
+_ALIASES = {
+    "A0": ("a0", "a", "aol", "avol", "ao", "open_loop_gain", "openloopgain", "dc_gain"),
+    "GBW": ("gbw", "gbp", "gb", "ft", "f_t", "unity_gain_bandwidth", "unitygainbandwidth", "ugb", "ugbw"),
+    "Rin": ("rin", "ri", "r_in", "input_resistance", "rid"),
+    "Rout": ("rout", "ro", "r_out", "output_resistance"),
+    "SR": ("sr", "slew_rate", "slewrate", "slew"),
+}
+
+
+def _op_value(raw, gain: bool = False) -> float:
+    """'100 dB' -> 1e5 (gains only), '1 MHz' -> 1e6, '2 MΩ' -> 2e6, 75 -> 75."""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw).strip()
+    if gain and "db" in s.lower():
+        return 10 ** (float(re.match(r"\s*([-+]?[\d.]+)", s).group(1)) / 20)
+    return parse_value(s)
+
+
+def resolve_opamp(c: Component, conventions: Optional[dict] = None) -> Optional[Dict[str, object]]:
+    """None for an ideal op-amp; otherwise {A0, GBW, Rin, Rout, SR, notes} with missing values filled
+    from conventions.yaml (A0 = 1e5 and GBW = 1 MHz, 741-class) and a note saying which were assumed.
+
+    Rules:
+      - nothing given and model "ideal"            -> ideal (None)
+      - a real part named (model "741") but no data -> A0 and GBW from conventions
+      - any data given but no A0                    -> A0 from conventions (the gain is what makes it non-ideal)
+      - A0 given, no GBW                            -> no pole: A is frequency-independent
+    """
+    p = {str(k).strip().lower().replace(" ", "_").replace("-", "_"): v for k, v in (c.params or {}).items()}
+    raw = {key: next((p[a] for a in aliases if p.get(a) not in (None, "")), None) for key, aliases in _ALIASES.items()}
+    model = (c.model or "").strip().lower()
+    if all(v is None for v in raw.values()) and model in _IDEAL_NAMES:
+        return None
+
+    op = (conventions or {}).get("opamp") or {}
+    notes: List[str] = []
+    A0 = _op_value(raw["A0"], gain=True) if raw["A0"] is not None else None
+    GBW = _op_value(raw["GBW"]) if raw["GBW"] is not None else None
+    named_part = model not in _IDEAL_NAMES | _GENERIC_NONIDEAL
+    if A0 is None:
+        A0 = float(op.get("A0", 1e5))
+        notes.append(f"A0 = {A0:g} assumed (typical, not given)")
+    if GBW is None and named_part and raw["A0"] is None:
+        GBW = float(op.get("GBW", 1e6))
+        notes.append(f"GBW = {GBW:g} Hz assumed (typical {c.model}-class value, not given)")
+    return {
+        "A0": A0, "GBW": GBW,
+        "Rin": _op_value(raw["Rin"]) if raw["Rin"] is not None else None,
+        "Rout": _op_value(raw["Rout"]) if raw["Rout"] is not None else None,
+        "SR": raw["SR"], "notes": notes,
+    }
+
+
+# ----------------------------------------------------------------------
 class MNA:
     def __init__(self, components: List[Component], mode: str,
                  overrides: Optional[Dict[str, object]] = None,
-                 removed: Optional[set] = None):
+                 removed: Optional[set] = None, conventions: Optional[dict] = None):
         if mode not in ("dc", "ac"):
             raise ValueError("mode must be 'dc' or 'ac'")
         removed = set(removed or ())
         self.mode = mode
+        self.conventions = conventions or {}
+        self.opamp_info: Dict[str, Optional[Dict[str, object]]] = {}   # id -> None (ideal) or resolved params
+        self.tokens: Dict[str, str] = {}                               # extra display tokens, e.g. U1_A -> "1e5"
         self.components = [c for c in components if c.id not in removed]
         self.by_id = {c.id: c for c in self.components}
         self.overrides = {k: sp.sympify(v) for k, v in (overrides or {}).items()}
 
         later = sorted({c.type.value for c in self.components} - LINEAR_TYPES)
         if later:
-            raise NotSupportedError("The DC/AC solver handles R, L, C, independent and controlled sources; "
+            raise NotSupportedError("The DC/AC solver handles R, L, C, sources, controlled sources and op-amps; "
                                     + ", ".join(LATER_PHASE.get(t, t) for t in later) + " come later.")
 
         # AC analysis: if any source has an AC magnitude, only AC parts are used (like SPICE).
@@ -126,7 +198,7 @@ class MNA:
         self.branch: Dict[str, sp.Symbol] = {}
         for c in self.components:
             t = c.type.value
-            if t in ("V", "E", "H") or (t == "L" and mode == "dc"):
+            if t in BRANCH_TYPES or (t == "L" and mode == "dc"):
                 self.branch[c.id] = sp.Symbol(f"I_{c.id}")
 
         self.kcl: Dict[str, List[Term]] = {n: [] for n in self.nodes}
@@ -250,6 +322,10 @@ class MNA:
             t = c.type.value
             a, b = c.nodes[0], c.nodes[1]
 
+            if t == "OPAMP":                          # see module docstring
+                self._stamp_opamp(c)
+                continue
+
             # KCL contributions
             if t in ("R", "C") or (t == "L" and self.mode == "ac"):
                 for p, q in ((a, b), (b, a)):
@@ -279,6 +355,52 @@ class MNA:
                 ie, it = self.current(self._control(c))
                 self.constraints.append((lhs_e - self.value(c) * ie,
                                          f"{lhs_t} = {{{c.id}}}*{paren(it)}", c.id))
+
+    def _stamp_opamp(self, c: Component) -> None:
+        """Ideal:     V(in-) = V(in+)                                  (virtual short)
+        Non-ideal:    V(out) = A(s)·(V(in+) - V(in-)) + Rout·I_U         (Thevenin output)
+                      A(s) = A0 / (1 + s/ωp),  ωp = 2π·GBW/A0  (A = A0 in DC or without GBW)
+                      plus Rin between in+ and in- (adds KCL terms at both inputs)
+        Either way the output carries the unknown current I_U (from out into the op-amp)."""
+        out, inp, inm = c.nodes
+        I_U = self.branch[c.id]
+        if out != GROUND:
+            self.kcl[out].append(Term(I_U, f"{{I_{c.id}}}"))
+        vp = "0" if inp == GROUND else f"{{V_{inp}}}"
+        vm = "0" if inm == GROUND else f"{{V_{inm}}}"
+
+        info = resolve_opamp(c, self.conventions)
+        self.opamp_info[c.id] = info
+        if info is None:
+            self.constraints.append((self.V[inm] - self.V[inp], f"{vm} = {vp}", c.id))
+            return
+
+        A0 = sp.nsimplify(info["A0"], rational=True)
+        if self.mode == "ac" and info["GBW"]:
+            wp = 2 * sp.pi * sp.nsimplify(info["GBW"], rational=True) / A0
+            A = A0 / (1 + s / wp)
+            self.tokens[f"{c.id}_A"] = f"{info['A0']:g}/(1 + s/{float(wp):.4g})"
+        else:
+            A = A0
+            self.tokens[f"{c.id}_A"] = f"{info['A0']:g}"
+
+        if info["Rin"]:                                     # input resistance between the inputs
+            Rin = sp.nsimplify(info["Rin"], rational=True)
+            self.tokens[f"{c.id}_Rin"] = f"{info['Rin']:g}"
+            for p, q in ((inp, inm), (inm, inp)):
+                if p != GROUND:
+                    dv, dt = self._dv(p, q)
+                    self.kcl[p].append(Term(dv / Rin, f"{dt}/{{{c.id}_Rin}}"))
+
+        vd_e, vd_t = self._dv(inp, inm)
+        expr = self.V[out] - A * vd_e
+        text = f"{{V_{out}}} = {{{c.id}_A}}*{paren(vd_t)}"
+        if info["Rout"]:
+            Rout = sp.nsimplify(info["Rout"], rational=True)
+            self.tokens[f"{c.id}_Rout"] = f"{info['Rout']:g}"
+            expr -= Rout * I_U
+            text += f" + {{{c.id}_Rout}}*{{I_{c.id}}}"
+        self.constraints.append((expr, text, c.id))
 
     def known_nodes(self) -> Dict[str, Tuple[sp.Expr, str, str]]:
         """Nodes fixed directly by a grounded independent voltage source: node -> (value, display, source id)."""

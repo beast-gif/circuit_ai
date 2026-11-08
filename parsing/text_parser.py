@@ -162,6 +162,9 @@ def normalize(data: Dict[str, Any]) -> Dict[str, Any]:
             c["model"] = str(c["model"]).strip()
         if c.get("params") is None:
             c.pop("params", None)
+        # an op-amp WITH data is not ideal: the default "ideal" label would be misleading in the netlist
+        if c.get("type") == "OPAMP" and c.get("params") and str(c.get("model") or "").lower() == "ideal":
+            c["model"] = "nonideal"
         comps.append(c)
     out["components"] = comps
 
@@ -311,6 +314,90 @@ def consistency_errors(question: str, nl: Netlist) -> List[str]:
 
     errors += _dangling_errors(question, nl)
     errors += _added_element_errors(question, nl)
+    errors += _opamp_errors(question, nl)
+    return errors
+
+
+# ----------------------------------------------------------------------
+# Op-amp checks (Phase 2)
+# ----------------------------------------------------------------------
+_PASSIVE = {"R", "C", "L"}
+# "inverting amplifier / amp / summer ..." but NOT "non-inverting" and NOT "inverting input"
+_INVERTING = re.compile(r"(?<!non-)(?<!non )\binverting\s+(?:op[- ]?amp\s+)?(?:amplifier|amp\b|configuration|summ)",
+                        re.IGNORECASE)
+_NONINVERTING = re.compile(r"\bnon[- ]?inverting\s+(?:op[- ]?amp\s+)?(?:amplifier|amp\b|configuration)", re.IGNORECASE)
+_FOLLOWER = re.compile(r"\b(?:voltage\s+)?follower\b|\bunity[- ]gain\s+buffer\b|\bbuffer\s+amplifier\b", re.IGNORECASE)
+
+
+def _has_feedback(nl: Netlist, out: str, inm: str) -> bool:
+    """Is there a path of R/C/L elements from the output to the − input that does not pass through ground?
+    (a single Rf, a T-network, an RC network ... all count)"""
+    if out == inm:
+        return True
+    adj: Dict[str, set] = defaultdict(set)
+    for c in nl.components:
+        if c.type.value in _PASSIVE:
+            a, b = c.nodes
+            adj[a].add(b)
+            adj[b].add(a)
+    seen, stack = {out}, [out]
+    while stack:
+        n = stack.pop()
+        for m in adj[n]:
+            if m == inm:
+                return True
+            if m != "0" and m not in seen:
+                seen.add(m)
+                stack.append(m)
+    return False
+
+
+def _to_ground_only(nl: Netlist, node: str, skip: str) -> bool:
+    """True if `node` is ground, or every element touching it (except op-amp `skip`) goes to ground."""
+    if node == "0":
+        return True
+    touching = [c for c in nl.components if c.id != skip and node in c.nodes]
+    return bool(touching) and all(c.type.value in _PASSIVE and set(c.nodes) == {node, "0"} for c in touching)
+
+
+def _opamp_errors(question: str, nl: Netlist) -> List[str]:
+    ops = [c for c in nl.components if c.type.value == "OPAMP"]
+    if not ops:
+        return []
+    errors: List[str] = []
+
+    for u in ops:
+        out, inp, inm = u.nodes
+        if not _has_feedback(nl, out, inm):
+            errors.append(f"{u.id} has no feedback path from its output '{out}' to its − input '{inm}'. A linear "
+                          f"op-amp circuit needs negative feedback (e.g. Rf between out and in−). Remember the node "
+                          f"order is ['out', 'in+', 'in−'].")
+
+    grounded = [u for u in ops if _to_ground_only(nl, u.nodes[1], u.id)]
+    if _INVERTING.search(question) and not grounded:
+        u = ops[0]
+        errors.append(f"The question describes an inverting amplifier: the op-amp's + input goes to ground and the "
+                      f"signal reaches the − input through the input resistor. Here {u.id}'s + input is "
+                      f"'{u.nodes[1]}'. Use nodes ['{u.nodes[0]}', '0', '<node of the input resistor>'].")
+    if _NONINVERTING.search(question) and len(grounded) == len(ops):
+        u = ops[0]
+        errors.append(f"The question describes a non-inverting amplifier: the signal goes to the op-amp's + input. "
+                      f"Here {u.id}'s + input is grounded. Use nodes ['{u.nodes[0]}', '<input node>', "
+                      f"'<node between R1 and Rf>'].")
+    if _FOLLOWER.search(question) and not any(u.nodes[0] == u.nodes[2] for u in ops):
+        u = ops[0]
+        errors.append(f"A voltage follower ties the − input directly to the output. Use nodes "
+                      f"['{u.nodes[0]}', '<input node>', '{u.nodes[0]}'] for {u.id}.")
+
+    caps = [c for c in nl.components if c.type.value == "C"]
+    if re.search(r"\bintegrator\b", question, re.IGNORECASE) and not any(
+            set(c.nodes) == {u.nodes[0], u.nodes[2]} for u in ops for c in caps):
+        errors.append("An op-amp integrator has the capacitor in the feedback path, between the output and the "
+                      "− input (the resistor goes from the input to the − input).")
+    if re.search(r"\bdifferentiator\b", question, re.IGNORECASE) and not any(
+            u.nodes[2] in c.nodes and u.nodes[0] not in c.nodes for u in ops for c in caps):
+        errors.append("An op-amp differentiator has the capacitor at the input (from the input to the − input) "
+                      "and the resistor in the feedback path (between the output and the − input).")
     return errors
 
 
@@ -320,11 +407,10 @@ def _dangling_errors(question: str, nl: Netlist) -> List[str]:
     (e.g. 'a source and resistor form a loop' parsed as R1 n1 x with x connected to nothing)."""
     conn: Dict[str, List[str]] = defaultdict(list)
     for c in nl.components:
-        t = c.type.value
-        skip = {2, 3} if t in ("E", "G") else ({1, 2} if t == "OPAMP" else set())   # sensing / input pins
-        for i, n in enumerate(c.nodes):
-            if i not in skip:
-                conn[n].append(c.id)
+        # every pin counts, including op-amp inputs and E/G sensing pins: they carry no current, but a
+        # source feeding only an op-amp's + input (non-inverting amp, follower) is wired, not a loose end
+        for n in c.nodes:
+            conn[n].append(c.id)
 
     queried = set()
     for q in nl.query:

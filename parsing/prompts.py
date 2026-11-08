@@ -36,6 +36,27 @@ TYPES AND NODE ORDER (order matters)
     "pushes / injects / delivers current into node b"          -> ["0", "b", ...]   ("from" = the other side)
     "draws / sinks / pulls current out of node b to ground"     -> ["b", "0", ...]
 
+OP-AMP RULES (type "OPAMP", nodes ["out", "in+", "in-"])
+- The op-amp has NO supply pins in the netlist and its output is referenced to ground automatically.
+  If the question gives supply rails (e.g. +/-12 V), do not add sources for them: put "supply +/-12 V"
+  in "assumptions".
+- Ideal unless the question gives non-ideal data. Only if the question gives them, put them in "params" with
+  these keys: "A0" (open-loop gain), "GBW" (gain-bandwidth / unity-gain frequency in Hz), "Rin", "Rout", "SR"
+  (slew rate). Numbers in base units (100000, 1000000) or strings with units ("100 dB", "1 MHz", "2 MΩ").
+  If the question names a real op-amp (741, LM358, TL071) but gives no values, set "model" to that name and
+  leave "params" empty: textbook typical values are filled in automatically.
+- Every op-amp in a linear circuit needs NEGATIVE FEEDBACK: some element path from "out" back to "in-".
+- Standard circuits (node names are examples):
+    inverting amplifier   : Rin ["in","n1"], Rf ["n1","out"], op-amp ["out","0","n1"]           (in+ grounded)
+    non-inverting amp     : source ["in","0"], R1 ["n1","0"], Rf ["n1","out"], op-amp ["out","in","n1"]
+    voltage follower/buffer: op-amp ["out","in","out"]                                         (in- tied to out)
+    summing amplifier     : one resistor from each input source to n1, Rf ["n1","out"], op-amp ["out","0","n1"]
+    difference amplifier  : R1 [v2 node,"n1"], R2 ["n1","out"], R3 [v1 node,"p"], R4 ["p","0"], op-amp ["out","p","n1"]
+    integrator            : R ["in","n1"], C ["n1","out"], op-amp ["out","0","n1"]
+    differentiator        : C ["in","n1"], R ["n1","out"], op-amp ["out","0","n1"]
+- "Gain", "voltage gain", "Vout/Vin" -> query "H(out,in)". Output voltage -> "V(out)".
+  Op-amp output current -> "I(U1)". Do NOT ask for P of an op-amp.
+
 ONLY WHAT THE QUESTION DESCRIBES
 - Include ONLY the components the question describes. NEVER add test sources, 0 V "ammeter" sources, shorts,
   loads or probes. Thevenin, Norton, impedance and resistance queries (Rth, Vth, Isc, In, Rn, Z) make the
@@ -127,6 +148,27 @@ the source's negative terminal. Find the Norton equivalent at a-b.
    {"id": "R2", "type": "R", "nodes": ["a", "0"], "value": "6k"}],
  "query": ["Isc(a,0)", "Rn(a,0)"], "frequency": null,
  "assumptions": ["terminal b is the ground node 0"], "missing_info": []}
+
+Question: An inverting amplifier with an ideal op-amp has Rin = 2.2 kOhm and Rf = 22 kOhm, powered from
++/-15 V. A 0.5 V DC input is applied. Find the output voltage and the voltage gain.
+{"analysis": "dc",
+ "components": [
+   {"id": "V1", "type": "V", "nodes": ["in", "0"], "value": "0.5"},
+   {"id": "R1", "type": "R", "nodes": ["in", "n1"], "value": "2.2k"},
+   {"id": "R2", "type": "R", "nodes": ["n1", "out"], "value": "22k"},
+   {"id": "U1", "type": "OPAMP", "nodes": ["out", "0", "n1"], "model": "ideal"}],
+ "query": ["V(out)", "H(out,in)"], "frequency": null,
+ "assumptions": ["ideal op-amp", "supply +/-15 V"], "missing_info": []}
+
+Question: A non-inverting amplifier has R1 = 3.3 kOhm from the inverting input to ground and Rf = 6.6 kOhm
+from the output to the inverting input. Find the output voltage for a 0.4 V input.
+{"analysis": "dc",
+ "components": [
+   {"id": "V1", "type": "V", "nodes": ["in", "0"], "value": "0.4"},
+   {"id": "U1", "type": "OPAMP", "nodes": ["out", "in", "n1"], "model": "ideal"},
+   {"id": "R1", "type": "R", "nodes": ["n1", "0"], "value": "3.3k"},
+   {"id": "R2", "type": "R", "nodes": ["n1", "out"], "value": "6.6k"}],
+ "query": ["V(out)"], "frequency": null, "assumptions": ["ideal op-amp"], "missing_info": []}
 
 Question: Find the equivalent resistance between terminals a and b: R1 = 10 Ohm from a to node c, and
 R2 = 20 Ohm and R3 = 20 Ohm both from c to b.

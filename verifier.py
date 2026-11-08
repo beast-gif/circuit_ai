@@ -38,13 +38,18 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import sympy as sp
 
-from llm_client import load_config
+from llm_client import load_config, load_conventions
 from schemas import AnalysisType, Netlist, SolveResult, is_symbolic, parse_value
+from solvers.mna import resolve_opamp
 from solvers.base import fmt_complex, fmt_num, fmt_si
 
 GROUND = "0"
 INDEP = {"V", "I"}
-LINEAR = {"R", "C", "L", "V", "I", "E", "G", "F", "H"}
+LINEAR = {"R", "C", "L", "V", "I", "E", "G", "F", "H", "OPAMP"}
+# An ideal op-amp is simulated as a VCVS  out-0 = A·(V+ − V−)  with a huge A. The closed-loop error is
+# about |closed-loop gain| / A: an integrator with |H| = 15 900 at 0.1 Hz is off by 1.6e-5 with A = 1e9
+# (it would be 1.6 % with A = 1e6, which is why 1e9 is used).
+OPAMP_GAIN = 1e9
 OUT_NAMES = ("out", "vout", "Vout", "o", "output")
 SAMPLE_FREQS = [0.1, 1.0, 10.0, 100.0, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8]
 UNITS = {"V": "V", "Vth": "V", "I": "A", "Isc": "A", "In": "A", "P": "W",
@@ -128,7 +133,7 @@ def vexpr(a: str, b: str = GROUND) -> str:
 
 
 def build_deck(nl: Netlist, sources: Dict[str, Src], removed: Sequence[str] = (),
-               sense: Sequence[str] = (), extra: Sequence[str] = ()) -> str:
+               sense: Sequence[str] = (), extra: Sequence[str] = (), conventions: Optional[dict] = None) -> str:
     """Netlist -> SPICE deck. Element X becomes <type>_<id> (e.g. R_R1) so names always start
     with the right letter. Components in `sense` get a 0 V source V_sense_<id> in series at nodes[0]."""
     comps = [c for c in nl.components if c.id not in set(removed)]
@@ -161,6 +166,26 @@ def build_deck(nl: Netlist, sources: Dict[str, Src], removed: Sequence[str] = ()
             lines.append(f"{name} {nodes[0]} {nodes[1]} DC {_num(dc)} AC {_num(ac)} {_num(ph)}")
         elif t in ("E", "G"):
             lines.append(f"{name} {' '.join(nodes)} {_num(parse_value(c.value))}")
+        elif t == "OPAMP":                                  # nodes = [out, in+, in-]
+            info = resolve_opamp(c, conventions)
+            out, inp, inm = nodes
+            if info is None:
+                lines.append(f"E_{c.id} {out} 0 {inp} {inm} {_num(OPAMP_GAIN)}")
+            else:
+                # Independent macro-model (not the solver's equation):
+                #   G (1 S) pushes Vd into node x, R = A0 Ω to ground  -> V(x) = A0·Vd
+                #   C = 1/(2π·GBW) across R                             -> pole at GBW/A0
+                #   unity buffer E from x, then Rout to the output; Rin between the inputs
+                x, o = f"{c.id}_x", (f"{c.id}_o" if info["Rout"] else out)
+                lines.append(f"G_{c.id} 0 {x} {inp} {inm} 1")
+                lines.append(f"R_{c.id}_a {x} 0 {_num(info['A0'])}")
+                if info["GBW"]:
+                    lines.append(f"C_{c.id}_p {x} 0 {_num(1 / (2 * math.pi * info['GBW']))}")
+                lines.append(f"E_{c.id} {o} 0 {x} 0 1")
+                if info["Rout"]:
+                    lines.append(f"R_{c.id}_o {o} {out} {_num(info['Rout'])}")
+                if info["Rin"]:
+                    lines.append(f"R_{c.id}_i {inp} {inm} {_num(info['Rin'])}")
         elif t in ("F", "H"):
             lines.append(f"{name} {nodes[0]} {nodes[1]} {ctrl_name(c.control.strip())} {_num(parse_value(c.value))}")
         else:
@@ -168,7 +193,10 @@ def build_deck(nl: Netlist, sources: Dict[str, Src], removed: Sequence[str] = ()
     lines += list(extra)
     # 1 TΩ from every node to ground: keeps ngspice's DC bias point solvable when a node is reached
     # only through capacitors (needed before an AC run). Effect on kΩ-MΩ circuits: < 1e-6 relative.
-    lines.append(".options rshunt=1e12")
+    # Only added when the circuit has a C or L: without them it is not needed, and it would spoil
+    # very large answers (a non-inverting amp's input resistance is ~1e10 Ω, 1 % of 1 TΩ).
+    if any(c.type.value in ("C", "L") for c in comps):
+        lines.append(".options rshunt=1e12")
     return "\n".join(lines) + "\n"
 
 
@@ -198,6 +226,7 @@ class Verifier:
         self.tol_sweep = float(sv.get("spice_tolerance_sweep", 2e-3))
         self.timeout = float(sv.get("ngspice_timeout_s", 30))
         self.exe = find_ngspice(sv.get("ngspice_path"))
+        self.conv = load_conventions(cfg)
 
     # ------------------------------------------------------------------
     def run(self, deck: str, control: List[str], keys: Sequence[str] = (),
@@ -307,7 +336,7 @@ class Verifier:
         ctl = _Ctl()
         ctl.cmd("op")
         keys = {label: ctl.probe(e) for label, e in exprs.items()}
-        vals, _ = self.run(build_deck(self.nl, **deck), ctl.lines, list(keys.values()))
+        vals, _ = self.run(build_deck(self.nl, conventions=self.conv, **deck), ctl.lines, list(keys.values()))
         return {label: vals[k] for label, k in keys.items()}
 
     def _ac(self, exprs: Dict[str, str], freqs: Sequence[float], **deck) -> Dict[str, np.ndarray]:
@@ -318,7 +347,7 @@ class Verifier:
             for label, e in exprs.items():
                 keys[label].append((ctl.probe(f"real({e})"), ctl.probe(f"imag({e})")))
         flat = [k for pairs in keys.values() for pair in pairs for k in pair]
-        vals, _ = self.run(build_deck(self.nl, **deck), ctl.lines, flat)
+        vals, _ = self.run(build_deck(self.nl, conventions=self.conv, **deck), ctl.lines, flat)
         return {label: np.array([complex(vals[r], vals[i]) for r, i in pairs]) for label, pairs in keys.items()}
 
     def _sweep(self, ratio: str, start: float, stop: float, points: int, lin: bool, **deck):
@@ -327,7 +356,7 @@ class Verifier:
         ctl.cmd(f"let hr = real({ratio})")
         ctl.cmd(f"let hi = imag({ratio})")
         ctl.cmd("wrdata sweep.txt hr hi")
-        _, data = self.run(build_deck(self.nl, **deck), ctl.lines, files=["sweep.txt"])
+        _, data = self.run(build_deck(self.nl, conventions=self.conv, **deck), ctl.lines, files=["sweep.txt"])
         f, h = [], []
         for line in data["sweep.txt"].splitlines():
             parts = line.split()
@@ -458,7 +487,7 @@ class Verifier:
 
         if kind == "I":
             c = next(x for x in self.nl.components if x.id == a)
-            sign = -1.0 if c.type.value in ("V", "E", "H") else 1.0   # solver reports current DELIVERED
+            sign = -1.0 if c.type.value in ("V", "E", "H", "OPAMP") else 1.0   # solver reports current DELIVERED
             return self._value(q, f"i(V_sense_{a})", unit, nat, sign=sign, sense=[a])
 
         if kind == "P":
@@ -491,6 +520,16 @@ class Verifier:
             mm = self._dc(exprs, sources=self._driven(drv.id))
             h = mm["n"] / mm["d"] if "d" in mm else mm["n"]
             return self._compare(q, self._solver_value(q), complex(h), unit)
+
+        if kind == "bandwidth":
+            # a low-pass bandwidth IS a -3 dB point, so ngspice can check it directly like fc
+            # (a band-pass BW = f_H - f_L is not, and falls through to the algebra check on H)
+            try:
+                chk = self._check_fc(q)
+                if chk.status == "ok":
+                    return Check(q, chk.solver, chk.spice, chk.rel_err, chk.status, "low-pass: BW = fc, " + chk.note)
+            except _Skip:
+                pass
 
         if kind in DERIVED:
             out, inp = self._default_io()

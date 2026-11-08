@@ -33,7 +33,7 @@ import sympy as sp  # noqa: E402
 PREFIXES = {
     "V": ("V(",), "Vth": ("Vth(", "V("), "I": ("I(",), "Isc": ("Isc(", "In("), "P": ("P(",),
     "Rth": ("Rth(", "Zth(", "Z(", "Rn(", "Rin", "Rout"), "Z": ("Z(", "Zth(", "Rth(", "Rin"),
-    "fc": ("fc",), "f0": ("f0",), "Qfactor": ("Qfactor",), "bandwidth": ("bandwidth",), "tau": ("tau",),
+    "fc": ("fc",), "f0": ("f0",), "Qfactor": ("Qfactor",), "bandwidth": ("bandwidth", "fc"), "tau": ("tau",),
     "gain": ("gain", "H("),
 }
 

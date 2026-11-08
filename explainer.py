@@ -140,13 +140,16 @@ def render_answers(res: SolveResult) -> str:
 
 
 def render_verification(res: SolveResult) -> str:
+    sat = [n.removeprefix("saturation: ") for n in res.verification_notes if n.startswith("saturation:")]
+    other = [n for n in res.verification_notes if not n.startswith("saturation:")]
     if res.verified is True:
-        return "✅ Cross-checked with ngspice: all answers match."
-    if res.verified is False:
-        return "⚠️ ngspice disagrees with at least one answer, so treat it with caution: " + "; ".join(
-            n for n in res.verification_notes if "vs ngspice" in n)
-    return "ℹ️ Not cross-checked with ngspice" + (
-        f" ({res.verification_notes[-1]})" if res.verification_notes else "") + "."
+        line = "✅ Cross-checked with ngspice: all answers match."
+    elif res.verified is False:
+        line = "⚠️ ngspice disagrees with at least one answer, so treat it with caution: " + "; ".join(
+            n for n in other if "vs ngspice" in n)
+    else:
+        line = "ℹ️ Not cross-checked with ngspice" + (f" ({other[-1]})" if other else "") + "."
+    return line + "".join(f"\n\n⚠️ {s}" for s in sat)
 
 
 # ----------------------------------------------------------------------

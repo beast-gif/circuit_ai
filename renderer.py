@@ -13,6 +13,10 @@ Layout ("ladder", fits most textbook circuits):
 Every element is labelled with its id and value, and sources say where their + terminal is,
 so polarity never depends on the symbol alone.
 
+Op-amps (Phase 2) are drawn as what an ideal op-amp is electrically: a controlled voltage source
+from the output node to ground, labelled with its + and − input nodes. Its inputs carry no
+current, so no wires are drawn to them (describe() lists every pin as well).
+
 describe() always works (text only). render_svg() needs schemdraw and returns None if
 drawing fails -- the pipeline never stops because of a picture.
 """
@@ -115,6 +119,8 @@ def _order_nodes(nl: Netlist) -> List[str]:
     nodes = [n for n in nl.nodes() if n != GROUND]
     adj: Dict[str, List[str]] = defaultdict(list)
     for c in nl.components:
+        if c.type.value == "OPAMP":               # its inputs carry no current: not a wire in the layout
+            continue
         a, b = c.nodes[0], c.nodes[1]
         if GROUND not in (a, b):
             adj[a].append(b)
@@ -141,7 +147,8 @@ def layout(nl: Netlist):
     shunts: Dict[str, List[Component]] = defaultdict(list)
     series: List[Component] = []
     for c in nl.components:
-        a, b = c.nodes[0], c.nodes[1]
+        # an op-amp is drawn as its equivalent dependent source from its output to ground
+        a, b = (c.nodes[0], GROUND) if c.type.value == "OPAMP" else (c.nodes[0], c.nodes[1])
         if a == GROUND or b == GROUND:
             shunts[b if a == GROUND else a].append(c)
         else:
@@ -220,8 +227,8 @@ def render_svg(nl: Netlist, background: Optional[str] = "white") -> Optional[str
         import schemdraw.elements as elm
     except ImportError:
         return None
-    if {c.type.value for c in nl.components} & {"D", "Q", "M", "OPAMP"}:
-        return None                                   # 3-terminal symbols come with Phases 2-3
+    if {c.type.value for c in nl.components} & {"D", "Q", "M"}:
+        return None                                   # diode / transistor symbols come with Phase 3
     try:
         schemdraw.use("svg")
         xpos, _, placements, wires, ground_xs = layout(nl)
@@ -232,6 +239,12 @@ def render_svg(nl: Netlist, background: Optional[str] = "white") -> Optional[str
                   "G": elm.SourceControlledI, "F": elm.SourceControlledI}
         for c, start, end in placements:
             t = c.type.value
+            if t == "OPAMP":
+                # ideal op-amp = output voltage source to ground set by its inputs; the label names the pins
+                _, inp, inm = c.nodes
+                label = f"{c.id} op-amp  (+ in: {_node(inp)}, − in: {_node(inm)})"
+                d.add(elm.SourceControlledV().endpoints(end, start).label(label))
+                continue
             if t == "V":
                 cls = elm.SourceSin if c.ac not in (None, "") and c.value in (None, "") else elm.SourceV
                 # draw from - to + so the symbol's + is at the + node; the label states it anyway

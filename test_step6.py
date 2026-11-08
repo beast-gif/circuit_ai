@@ -133,15 +133,25 @@ def graph_checks() -> bool:
                 r.status == "answered" and len(fake.hints) == 2 and "solver could not solve" in (fake.hints[1] or ""),
                 f"{r.status} hints={fake.hints}")
 
-    # 3. op-amp -> unsupported (no crash)
+    # 3. BJT -> unsupported until Phase 3 (no crash)
+    bjt = Netlist(analysis="dc", query=["V(c)"], question="BJT collector voltage",
+                  components=[C("V1", "V", ["vcc", "0"], "12"), C("RC", "R", ["vcc", "c"], "1k"),
+                              C("RB", "R", ["vcc", "b"], "100k"),
+                              Component(id="Q1", type="Q", nodes=["c", "b", "0"], model="NPN")])
+    ai = CircuitAI(use_llm=False, parse_fn=FakeParser(bjt), auto_confirm=True)
+    r = ai.ask("bjt")
+    ok &= check("BJT -> status unsupported with a reason", r.status == "unsupported" and "Phase 3" in r.explanation,
+                r.explanation)
+
+    # 4. op-amp -> now solved end to end (Phase 2)
     opamp = Netlist(analysis="dc", query=["V(out)"], question="inverting op-amp amplifier",
                     components=[C("V1", "V", ["in", "0"], "1"), C("R1", "R", ["in", "n1"], "1k"),
                                 C("R2", "R", ["n1", "out"], "10k"),
                                 Component(id="U1", type="OPAMP", nodes=["out", "0", "n1"])])
     ai = CircuitAI(use_llm=False, parse_fn=FakeParser(opamp), auto_confirm=True)
     r = ai.ask("op-amp")
-    ok &= check("op-amp -> status unsupported with a reason", r.status == "unsupported" and "Phase 2" in r.explanation,
-                r.explanation)
+    ok &= check("op-amp inverting amp -> answered, V(out) = -10 V", r.status == "answered" and "-10 V" in r.explanation,
+                r.explanation[:300])
 
     # 4. conceptual -> theory route
     concept = Netlist(analysis="conceptual", question="Why does feedback stabilize gain?")

@@ -165,15 +165,15 @@ def symbolic_and_error_checks() -> bool:
         good = abs(float(val) - 20 / 3) < 1e-9
     ok &= check("symbolic V(out) = R2·Vs/(R1+R2)", good, f"got {sym}")
 
-    # op-amp -> not supported until Phase 2
-    opamp = net([C("V1", "V", ["in", "0"], "1"), C("R1", "R", ["in", "n1"], "1k"),
-                 C("R2", "R", ["n1", "out"], "10k"), Component(id="U1", type="OPAMP", nodes=["out", "0", "n1"])],
-                ["V(out)"], question="Find Vout of the inverting op-amp amplifier.")
+    # BJT -> not supported until Phase 3 (op-amps became supported in Phase 2)
+    bjt = net([C("V1", "V", ["vcc", "0"], "12"), C("RC", "R", ["vcc", "c"], "1k"), C("RB", "R", ["vcc", "b"], "100k"),
+               Component(id="Q1", type="Q", nodes=["c", "b", "0"], model="NPN")],
+              ["V(c)"], question="Find the collector voltage of the BJT.")
     try:
-        get_solver(opamp)
-        ok &= check("op-amp -> NotSupportedError", False)
+        get_solver(bjt)
+        ok &= check("BJT -> NotSupportedError (Phase 3)", False)
     except NotSupportedError as e:
-        ok &= check("op-amp -> NotSupportedError", "Phase 2" in str(e), str(e))
+        ok &= check("BJT -> NotSupportedError (Phase 3)", "Phase 3" in str(e), str(e))
 
     # node joined only through capacitors in DC -> undefined
     caps = net([C("V1", "V", ["a", "0"], "10"), C("R1", "R", ["a", "0"], "1k"),
@@ -210,7 +210,7 @@ def classifier_checks() -> bool:
                  C("R2", "R", ["n1", "out"], "10k"), Component(id="U1", type="OPAMP", nodes=["out", "0", "n1"])],
                 ["V(out)"], question="Find Vout of the inverting op-amp amplifier.")
     c = classify(opamp)
-    ok &= check("op-amp -> topic opamp, no solver yet", c.topic == "opamp" and c.solver is None, str(c))
+    ok &= check("op-amp -> topic opamp, solved by dc_ac (Phase 2)", c.topic == "opamp" and c.solver == "dc_ac", str(c))
 
     wrong = net([C("V1", "V", ["in", "0"], "10"), C("R1", "R", ["in", "out"], "5k"),
                  C("R2", "R", ["out", "0"], "5k")], ["V(out)"],

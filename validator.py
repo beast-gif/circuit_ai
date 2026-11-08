@@ -103,6 +103,16 @@ def validate(nl: Netlist) -> ValidationReport:
         if len(variants) > 1:
             rep.errors.append(f"Node names differ only by case: {sorted(variants)}. Use one spelling.")
 
+    # --- op-amp pins ----------------------------------------------------
+    for c in nl.components:
+        if c.type.value == "OPAMP":
+            out, inp, inm = c.nodes
+            if out == "0":
+                rep.errors.append(f"{c.id}: the op-amp output is connected to ground. Its nodes are "
+                                  "['out', 'in+', 'in-']; the output must be its own node.")
+            if inp == inm:
+                rep.errors.append(f"{c.id}: both op-amp inputs are on node {inp}; in+ and in- must differ.")
+
     # --- ground ---------------------------------------------------------
     if "0" not in nodes:
         rep.errors.append('No ground node. One node must be named "0" (usually the source\'s negative terminal).')
