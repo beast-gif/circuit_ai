@@ -37,10 +37,13 @@ _Q_COMP = re.compile(r"^(I|P)\((\w+)\)$")                     # I(R1), P(R1)
 _Q_PORT = re.compile(r"^(Z|Rth|Vth|Zth|Isc|Rn|In)\((\w+),(\w+)\)$")  # Rth(a,b)
 _Q_TRANSFER = re.compile(r"^H\((\w+),(\w+)\)$")               # H(out,in) or H(out,V1)
 _Q_BIAS = re.compile(r"^bias\((\w+)\)$")                      # bias(Q1)
-_Q_BARE = re.compile(r"^(Rin|Rout|gain|fc|f0|poles|zeros|tau|Qfactor|bandwidth)$")
+_Q_BARE = re.compile(r"^(Rin|Rout|gain|fc|f0|poles|zeros|tau|Qfactor|bandwidth|filter)$")
+_Q_WAVE_V = re.compile(r"^(Vmax|Vmin|Vavg|Vrms|vtc|Vripple|Vpp|ripple)\((\w+)(?:,(\w+))?\)$")   # waveform of a node: Vavg(out)
+_Q_WAVE_C = re.compile(r"^(Imax|Iavg|Irms|PIV|conduction)\((\w+)\)$")       # of a component: PIV(D1)
 
 QUERY_HELP = ("V(node), V(a,b), I(comp), P(comp), Rth(a,b), Vth(a,b), Z(a,b), "
-              "H(out,in), bias(Q1), Rin, Rout, gain, fc, f0, poles, zeros, tau, Qfactor, bandwidth")
+              "H(out,in), bias(Q1), Rin, Rout, gain, fc, f0, poles, zeros, tau, Qfactor, bandwidth, filter, "
+              "Vmax(n), Vmin(n), Vavg(n), Vrms(n), vtc(n), Vripple(n), ripple(n), Imax(X), Iavg(X), Irms(X), PIV(D1), conduction(D1)")
 
 VOLTAGE_TYPES = {"V", "E", "H"}            # elements that force a voltage
 CURRENT_TYPES = {"I", "G", "F"}            # elements that force a current
@@ -194,7 +197,7 @@ def validate(nl: Netlist) -> ValidationReport:
                             "used as the AC amplitude.")
     if nl.analysis == AnalysisType.SMALL_SIGNAL and not any(t in {"Q", "M"} for t in types.values()):
         rep.warnings.append("Small-signal analysis requested but the circuit has no BJT or MOSFET.")
-    if nl.analysis == AnalysisType.TRANSIENT and not any(t in {"C", "L"} for t in types.values()):
+    if nl.analysis == AnalysisType.TRANSIENT and not any(t in {"C", "L", "D"} for t in types.values()):
         rep.warnings.append("Transient analysis requested but the circuit has no capacitor or inductor.")
 
     return rep
@@ -226,6 +229,14 @@ def _check_queries(nl: Netlist, nodes: List[str], types: Dict[str, str],
             need_comp(m.group(2), q)
         elif m := _Q_PORT.match(q):
             need_node(m.group(2), q); need_node(m.group(3), q)
+        elif m := _Q_WAVE_V.match(q):
+            need_node(m.group(2), q)
+            if m.group(3):
+                need_node(m.group(3), q)
+        elif m := _Q_WAVE_C.match(q):
+            need_comp(m.group(2), q)
+            if m.group(1) in ("PIV", "conduction") and m.group(2) in types and types[m.group(2)] != "D":
+                rep.errors.append(f"Query {q}: {m.group(1)}() needs a diode, {m.group(2)} is {types[m.group(2)]}.")
         elif m := _Q_TRANSFER.match(q):
             need_node(m.group(1), q)
             inp = m.group(2)

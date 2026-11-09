@@ -7,10 +7,13 @@ hand-worked answers.
     python benchmark/run_benchmark.py --limit 5       # first 5
     python benchmark/run_benchmark.py --ids dc,flt    # only ids starting with dc or flt
     python benchmark/run_benchmark.py --explain       # also generate explanations (costs more)
+    python benchmark/run_benchmark.py --file benchmark/opamp.jsonl   # Phase 2: op-amps + active filters
 
 Matching is by KIND, not by exact query name, because the parser may call a node "out" or "n2":
 an expectation {"kind": "V", "value": 8} passes if ANY V(...) answer is within --tol (default 1 %)
 of 8. "abs": true compares magnitudes (for currents/powers whose sign depends on direction).
+"tol": 0.001 on one expectation overrides --tol for it. {"kind": "saturation", "value": true} passes when
+the op-amp saturation warning is shown.
 Results are saved to benchmark/results/run_<time>.json.
 """
 from __future__ import annotations
@@ -33,7 +36,11 @@ import sympy as sp  # noqa: E402
 PREFIXES = {
     "V": ("V(",), "Vth": ("Vth(", "V("), "I": ("I(",), "Isc": ("Isc(", "In("), "P": ("P(",),
     "Rth": ("Rth(", "Zth(", "Z(", "Rn(", "Rin", "Rout"), "Z": ("Z(", "Zth(", "Rth(", "Rin"),
-    "fc": ("fc",), "f0": ("f0",), "Qfactor": ("Qfactor",), "bandwidth": ("bandwidth", "fc"), "tau": ("tau",),
+    "fc": ("fc", "filter.fc"), "f0": ("f0", "filter.f0"), "Qfactor": ("Qfactor", "filter.Q"), "K": ("filter.K",), "Rin": ("Rin", "Z("),
+    # waveforms: a plain V(out) answer of a rectifier carries .max/.min/.avg/.rms too
+    "Vmax": ("Vmax(", "V("), "Vmin": ("Vmin(", "V("), "Vavg": ("Vavg(", "V("), "Vrms": ("Vrms(", "V("),
+    "Vripple": ("Vripple(", "Vpp("), "ripple": ("ripple(",),
+    "Vout": ("V(", "Vmax(", "Vmin(", "Vavg(", "Vrms("),     # "the output voltage" of a ripple-free output "bandwidth": ("bandwidth", "fc"), "tau": ("tau",),
     "gain": ("gain", "H("),
 }
 
@@ -56,6 +63,8 @@ def candidates(numeric: Dict[str, Optional[float]], kind: str) -> List[Tuple[str
             continue
         if kind == "dc_gain":
             ok = k.endswith(".dc_gain")
+        elif kind == "K":                       # pass-band gain: from "filter", "gain" or "H(...)"
+            ok = k == "filter.K" or k.endswith(".K")
         elif kind == "pole":
             ok = re.fullmatch(r"poles\[\d+\]\.re", k) is not None
         else:
@@ -82,8 +91,14 @@ def same_expression(a: str, b: str) -> bool:
     return True
 
 
-def check_expectation(exp: Dict[str, Any], numeric: Dict, symbolic: Dict, tol: float) -> Tuple[bool, str]:
+def check_expectation(exp: Dict[str, Any], numeric: Dict, symbolic: Dict, tol: float,
+                      notes: Optional[List[str]] = None) -> Tuple[bool, str]:
     kind = exp["kind"]
+    tol = float(exp.get("tol", tol))               # a problem can demand a tighter match (non-ideal op-amps)
+    if kind == "saturation":                       # the op-amp saturation warning must (or must not) appear
+        warned = any(str(n).startswith("saturation:") for n in notes or [])
+        want = bool(exp.get("value", True))
+        return warned == want, f"saturation warning {'shown' if warned else 'not shown'}"
     if "symbolic" in exp:
         keys = [k for k in symbolic if k.startswith(PREFIXES.get(kind, (kind,)))]
         for k in keys:
@@ -142,7 +157,8 @@ def main() -> None:
         if st.get("status") != "answered":
             passed, details = False, [f"status={st.get('status')}: {st.get('error', '')[:120]}"]
         else:
-            checks = [check_expectation(e, numeric, symbolic, args.tol) for e in it["expect"]]
+            checks = [check_expectation(e, numeric, symbolic, args.tol, res.get("verification_notes"))
+                      for e in it["expect"]]
             passed, details = all(ok for ok, _ in checks), [d for _, d in checks]
 
         t = by_topic[it["topic"]]

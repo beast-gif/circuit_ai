@@ -57,6 +57,69 @@ OP-AMP RULES (type "OPAMP", nodes ["out", "in+", "in-"])
 - "Gain", "voltage gain", "Vout/Vin" -> query "H(out,in)". Output voltage -> "V(out)".
   Op-amp output current -> "I(U1)". Do NOT ask for P of an op-amp.
 
+ACTIVE FILTER TEMPLATES (second order; "a" = junction of the first two input elements, "p" = op-amp + input)
+    Sallen-Key low-pass, unity gain : R1 ["in","a"], R2 ["a","p"], C1 ["a","out"], C2 ["p","0"], op-amp ["out","p","out"]
+    Sallen-Key low-pass with gain K : same, but op-amp ["out","p","n1"], RA ["n1","0"], RB ["n1","out"]   (K = 1 + RB/RA)
+    Sallen-Key high-pass, unity gain: C1 ["in","a"], C2 ["a","p"], R1 ["a","out"], R2 ["p","0"], op-amp ["out","p","out"]
+    Sallen-Key high-pass with gain K: same, but op-amp ["out","p","n1"], RA ["n1","0"], RB ["n1","out"]
+    MFB low-pass (inverting)        : R1 ["in","a"], C1 ["a","0"], R2 ["a","out"], R3 ["a","n1"], C2 ["n1","out"], op-amp ["out","0","n1"]
+    MFB band-pass (inverting)       : R1 ["in","a"], C1 ["a","n1"], C2 ["a","out"], R3 ["n1","out"], op-amp ["out","0","n1"]
+                                      (+ R2 ["a","0"] only if the question has a resistor from a to ground)
+- In Sallen-Key the element from "a" to the OUTPUT is the positive-feedback element (a capacitor in the
+  low-pass, a resistor in the high-pass); the element at "p" goes to ground. The + input is never grounded.
+- In MFB the + input is grounded and the signal reaches the − input; there are TWO feedback paths from the
+  output (one to "a", one to the − input).
+- Keep the question's own names and values. If the question names the parts but does not say which capacitor
+  (or resistor) sits where, follow the template and write that choice in "assumptions", e.g.
+  "C1 assumed from a to the output, C2 from the + input to ground".
+- "Equal-component" Sallen-Key: every R has the same value and every C the same value.
+- Filter questions: "identify the filter", "what type of filter", "pass-band gain", "gain at the centre
+  frequency", "mid-band gain" -> query "filter" (it reports the type, K, f0 and Q). Do NOT use "gain" or
+  "H(out,in)" for these: a band-pass has zero gain at DC, so only "filter" gives the gain that is meant. Natural / centre / resonant frequency -> "f0";
+  -3 dB cutoff -> "fc"; Q -> "Qfactor"; bandwidth -> "bandwidth". Use analysis "ac" and add the AC input source.
+
+DIODE RULES (type "D", nodes ["anode", "cathode"])
+- The anode is the triangle side, the cathode the bar side; an ON diode conducts from anode to cathode.
+  "Forward-biased" = anode toward the more positive side. Follow the direction the question gives.
+- "model": "ideal" for an ideal diode; "zener" for a Zener (params {"VZ": 5.1}, plus "rz" if given);
+  "led" for an LED (params {"Von": 2} when its forward voltage is given); "exponential" when the question
+  gives IS or says to use the diode equation (params {"IS": 1e-14, "n": 1}); "germanium" for a germanium
+  diode; otherwise leave "model" empty (silicon, constant 0.7 V drop). A given cut-in / turn-on / forward
+  voltage -> params {"Von": 0.6}; a given forward (dynamic) resistance -> params {"rd": 20}.
+- A Zener used as a voltage regulator is REVERSE-connected: cathode on the regulated (+) node, anode at
+  ground -> nodes ["0", "out"].
+- Queries: diode current -> "I(D1)" (a Zener in breakdown reports its Zener current), node voltages
+  -> "V(out)", "which diodes conduct" / "state" / "operating point" -> "bias(D1)" for each diode.
+- Diode circuits with DC sources use analysis "dc". Rectifiers, clippers and clampers with an AC or
+  sinusoidal input use "transient".
+
+RECTIFIERS AND CLIPPERS (analysis "transient", a sinusoidal input)
+- The sinusoidal source: "ac" = its PEAK amplitude, e.g. {"id": "V1", "type": "V", "nodes": ["a", "0"], "ac": "10"}.
+  Given as RMS -> params {"Vrms": 12} and no "ac"; peak-to-peak -> params {"Vpp": 20}. Do NOT convert yourself.
+  A transformer with turns ratio N1:N2 -> give the PRIMARY value and params {"ratio": N1/N2}, e.g.
+  {"Vrms": 120, "ratio": 10} for 120 V rms into a 10:1 transformer. Frequency -> "frequency": "60".
+- Templates (node names are examples; RL is the load):
+    half-wave        : V1 ["a","0"], D1 ["a","out"], RL ["out","0"]
+    bridge           : V1 ["a","b"] (floating secondary), D1 ["a","out"], D2 ["b","out"], D3 ["0","a"],
+                       D4 ["0","b"], RL ["out","0"]
+    centre-tapped    : the secondary is TWO equal halves with the centre tap at ground: V1 ["a","0"] and
+                       V2 ["0","b"], each with HALF the total secondary voltage (params {"Vrms": 12} each for
+                       "24 V rms centre-tapped"); D1 ["a","out"], D2 ["b","out"], RL ["out","0"]
+    series clipper / limiter: R from the source to "out", the diode (and any reference battery in series with
+                       it) from "out" to ground, e.g. D1 ["out","x"], V2 ["x","0"] value "2" for "clips at 2.7 V"
+- Queries: peak output -> "Vmax(out)"; negative peak -> "Vmin(out)"; average / DC output -> "Vavg(out)";
+  RMS output -> "Vrms(out)"; peak inverse voltage -> "PIV(D1)"; peak / average diode current -> "Imax(D1)",
+  "Iavg(D1)"; conduction angle -> "conduction(D1)"; transfer characteristic or "sketch the output"
+  -> "vtc(out)" (add "Vmax(out)" and "Vmin(out)" too).
+- With capacitors (also analysis "transient"; give "frequency" when the question does):
+    capacitor filter : any rectifier above + C ["out","0"] across the load
+    clamper          : C from the source to "out" (in SERIES), the diode from "out" to ground, RL ["out","0"]
+                       if a load is given. Positive clamper (output pushed UP): D ["0","out"]; negative clamper
+                       (pushed DOWN): D ["out","0"]; a biased clamper has its battery in series with the diode.
+    voltage doubler  : C1 ["a","x"] from the source, D1 ["0","x"], D2 ["x","out"], C2 ["out","0"]
+- Ripple (peak-to-peak) -> "Vripple(out)"; ripple factor -> "ripple(out)"; DC output -> "Vavg(out)";
+  peak (repetitive surge) diode current -> "Imax(D1)"; conduction angle -> "conduction(D1)".
+
 ONLY WHAT THE QUESTION DESCRIBES
 - Include ONLY the components the question describes. NEVER add test sources, 0 V "ammeter" sources, shorts,
   loads or probes. Thevenin, Norton, impedance and resistance queries (Rth, Vth, Isc, In, Rn, Z) make the
@@ -107,8 +170,11 @@ QUERY FORMS (use exactly these)
   Isc(a,b)       Norton / short-circuit current       Rn(a,b)      Norton resistance (same as Rth)
   Z(a,b)         impedance or equivalent resistance seen between two nodes (all sources turned off)
   H(out,in)      transfer function Vout/Vin (in = node or source id)
-  bias(Q1)       DC operating point of a transistor
+  bias(Q1)       DC operating point of a transistor, or the state of a diode bias(D1) (ON/OFF, V, I)
   Rin  Rout  gain  fc  f0  poles  zeros  tau  Qfactor  bandwidth
+  filter         identify a filter: type (low-pass, high-pass, band-pass, notch), pass-band gain K, f0, Q
+  Input resistance of an amplifier or circuit with an input source -> "Rin" (NOT Z(in,0): Z turns the input
+  source into a short). Voltage gain -> "H(out,in)". Both need the input source V1 in the netlist.
 
 EXAMPLES
 
@@ -191,6 +257,29 @@ The output is taken across the capacitor. Find the transfer function and the res
    {"id": "L1", "type": "L", "nodes": ["n1", "out"], "value": "1m"},
    {"id": "C1", "type": "C", "nodes": ["out", "0"], "value": "10n"}],
  "query": ["H(out,in)", "f0"], "frequency": null, "assumptions": [], "missing_info": []}
+
+Question: A 12 V supply feeds a 5.1 V Zener diode through R = 470 Ohm, and a 1 kOhm load is connected across
+the Zener. Find the load voltage and the Zener current.
+{"analysis": "dc",
+ "components": [
+   {"id": "V1", "type": "V", "nodes": ["in", "0"], "value": "12"},
+   {"id": "R1", "type": "R", "nodes": ["in", "out"], "value": "470"},
+   {"id": "D1", "type": "D", "nodes": ["0", "out"], "model": "zener", "params": {"VZ": 5.1}},
+   {"id": "RL", "type": "R", "nodes": ["out", "0"], "value": "1k"}],
+ "query": ["V(out)", "I(D1)"], "frequency": null, "assumptions": ["Zener reverse-connected as a regulator"],
+ "missing_info": []}
+
+Question: A bridge rectifier is fed from a 12 V rms, 50 Hz secondary and drives a 1 kOhm load. Using silicon
+diodes, find the peak output voltage, the average output voltage and the PIV of each diode.
+{"analysis": "transient",
+ "components": [
+   {"id": "V1", "type": "V", "nodes": ["a", "b"], "params": {"Vrms": 12}},
+   {"id": "D1", "type": "D", "nodes": ["a", "out"]},
+   {"id": "D2", "type": "D", "nodes": ["b", "out"]},
+   {"id": "D3", "type": "D", "nodes": ["0", "a"]},
+   {"id": "D4", "type": "D", "nodes": ["0", "b"]},
+   {"id": "RL", "type": "R", "nodes": ["out", "0"], "value": "1k"}],
+ "query": ["Vmax(out)", "Vavg(out)", "PIV(D1)"], "frequency": "50", "assumptions": [], "missing_info": []}
 """
 
 TEXT_PARSER_USER = "Question:\n{question}\n\nReturn the JSON object only."

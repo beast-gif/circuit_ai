@@ -28,9 +28,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import sympy as sp
 
-from schemas import AnalysisType, Component, Netlist, SolveResult, StepTrace, parse_value
+from schemas import AnalysisType, Component, Netlist, SolveResult, StepTrace, is_symbolic, parse_value
 from solvers.base import (BaseSolver, NotSupportedError, SolverError, fmt_complex, fmt_num, fmt_si,
                           pretty, sig_figs)
+from solvers.filters import K_MEANING, Response, alignment, analyse, passband_reference
 from solvers.mna import (CONTROLLED, GROUND, INDEPENDENT, LATER_PHASE, LINEAR_TYPES, MNA, join_terms,
                          paren, resolve_opamp, s, tidy)
 
@@ -40,7 +41,7 @@ _Q = re.compile(r"^(\w+)\((\w+)(?:,(\w+))?\)$")
 _RAIL_SYM = re.compile(r"(?:±|\+/-|\+/−|\+-)\s*(\d+(?:\.\d+)?)\s*v\b", re.IGNORECASE)
 _RAIL_POS = re.compile(r"\bv(?:cc|dd|\+|pos)\s*=\s*\+?\s*(\d+(?:\.\d+)?)\s*v\b", re.IGNORECASE)
 _RAIL_NEG = re.compile(r"\bv(?:ee|ss|-|neg)\s*=\s*[-−]?\s*(\d+(?:\.\d+)?)\s*v\b", re.IGNORECASE)
-FREQ_KINDS = {"fc", "f0", "poles", "zeros", "Qfactor", "bandwidth"}
+FREQ_KINDS = {"fc", "f0", "poles", "zeros", "Qfactor", "bandwidth", "filter"}
 MAIN_KINDS = {"V", "I", "P", "Vth", "Isc", "In"}
 OUT_NAMES = ("out", "vout", "Vout", "o", "output")
 
@@ -64,6 +65,8 @@ class DCACSolver(BaseSolver):
 
     def supports(self, nl: Netlist) -> Tuple[bool, str]:
         types = {c.type.value for c in nl.components}
+        if "D" in types and not types & {"Q", "M"}:
+            return False, ""                      # the diode solver handles (or explains) diode circuits
         later = sorted(types - LINEAR_TYPES)
         if later:
             return False, "Needs " + ", ".join(LATER_PHASE.get(t, t) for t in later)
@@ -186,6 +189,7 @@ class _Job:
             "poles": self._q_roots, "zeros": self._q_roots,
             "fc": self._q_fc, "f0": self._q_f0, "Qfactor": self._q_f0, "bandwidth": self._q_bw,
             "tau": self._q_tau, "Rin": self._q_Rin, "Rout": self._q_Rout,
+            "filter": self._q_filter,
         }
         if kind == "bias":
             raise SolverError("bias() needs the diode/transistor solver (Phase 3)")
@@ -596,6 +600,17 @@ class _Job:
             else:
                 text += f";  H(0) = {pretty(h0, self.sig)}"
                 extras.append(("DC gain: put s = 0", "H(0)", f"H(0) = {pretty(h0, self.sig)}"))
+        # a filter's useful gain is its PASS-BAND gain K (a band-pass has H(0) = 0), so report it with any
+        # gain / H query, whatever query name the parser chose
+        resp = analyse(H)
+        if resp is not None and resp.kind != "other" and resp.K is not None:
+            ktxt = self._val(resp.K)
+            if not sp.sympify(resp.K).free_symbols:
+                self.res.numeric[q + ".K"] = complex(sp.N(resp.K)).real
+            if resp.kind != "low-pass":                    # for a low-pass K is the DC gain, already shown
+                text += f";  pass-band gain K = {ktxt} ({K_MEANING[resp.kind]})"
+                extras.append((f"Pass-band gain of the {resp.label}: compare with {resp.standard}", None,
+                               f"K = {ktxt}"))
         hj = self._at(H)
         if self.omega is not None and not hj.free_symbols:
             z = complex(sp.N(hj))
@@ -678,7 +693,8 @@ class _Job:
         self.trace.add(f"{kind.capitalize()}: roots of the {word} of H(s)",
                        f"{pretty(poly.as_expr(), self.sig)} = 0", self.res.answers[q])
 
-    def _cutoffs(self, H: sp.Expr) -> Tuple[List[float], float]:
+    def _cutoffs(self, H: sp.Expr, ref: Optional[float] = None) -> Tuple[List[float], float]:
+        """−3 dB frequencies: where |H(j2πf)| = ref/√2 (ref = |H|max unless given). -> (cuts, |H|max)"""
         fn = sp.lambdify(s, H, modules="numpy")
         f = np.logspace(-3, 12, 4001)
         with np.errstate(all="ignore"):
@@ -689,7 +705,7 @@ class _Job:
         hmax = float(np.max(mag[finite]))
         if hmax == 0:
             raise SolverError("|H| is zero at every frequency")
-        target = hmax / math.sqrt(2)
+        target = (ref if ref else hmax) / math.sqrt(2)
         d = mag - target
 
         def g(lf: float) -> float:
@@ -732,12 +748,15 @@ class _Job:
             self.trace.add("First-order circuit: single pole",
                            f"p = {fmt_num(p, self.sig)} rad/s  →  fc = |p|/(2π) = {fmt_num(abs(p), self.sig)}/(2π)",
                            f"fc = {fmt_si(abs(p) / (2 * math.pi), 'Hz', self.sig)}")
-        cuts, hmax = self._cutoffs(H)
+        resp = self._response()
+        ref, desc = self._reference(H, resp)
+        cuts, hmax = self._cutoffs(H, ref)
         if not cuts:
-            raise SolverError("|H| never falls 3 dB below its peak between 1 mHz and 1 THz")
-        self.trace.add("−3 dB condition: |H(j2πf)| = |H|max / √2",
-                       f"|H|max = {fmt_num(hmax, self.sig)}  →  solve |H(j2πf)| = "
-                       f"{fmt_num(hmax, self.sig)}/√2 = {fmt_num(hmax / math.sqrt(2), self.sig)}"
+            raise SolverError(f"|H| never falls 3 dB below the {desc} between 1 mHz and 1 THz")
+        ref = ref or hmax
+        self.trace.add(f"−3 dB condition: |H(j2πf)| = {desc} / √2",
+                       f"{desc} = {fmt_num(ref, self.sig)}  →  solve |H(j2πf)| = "
+                       f"{fmt_num(ref, self.sig)}/√2 = {fmt_num(ref / math.sqrt(2), self.sig)}"
                        + ("" if den.degree() == 1 else "  (solved numerically)"),
                        level="key" if den.degree() != 1 else "full")
         self.res.numeric[q] = cuts[0]
@@ -800,6 +819,7 @@ class _Job:
         return f0
 
     def _q_f0(self, q, kind, a, b):
+        self._response()                       # names the filter type first (no effect on the numbers)
         so = self._second_order()
         if kind == "f0":
             if so:
@@ -826,23 +846,155 @@ class _Job:
             return False
         return abs(complex(sp.N(h0))) >= hmax * (1 - 1e-3)
 
-    def _q_bw(self, q, kind, a, b):
+    # --- filter identification (Phase 2, step 4) -----------------------
+    def _reference(self, H: sp.Expr, resp: Optional[Response]) -> Tuple[Optional[float], str]:
+        """Gain the −3 dB points are measured from: |K| for a low-/high-pass (textbook definition, also
+        when the response peaks above K), |H|max otherwise (returned as None = 'use the peak')."""
+        ref, desc = passband_reference(resp, 0.0)
+        return (ref if ref > 0 else None), desc
+
+    def _val(self, expr, unit: str = "") -> str:
+        if expr is None:
+            return "-"
+        if expr == sp.oo:
+            return "∞"
+        return self._fmt(expr, unit)[0]
+
+    def _response(self) -> Optional[Response]:
+        """Filter type of the default transfer function, with one key step. Cached; None if unknown."""
+        if hasattr(self, "_resp"):
+            return self._resp
+        self._resp = None
         try:
-            so = self._second_order()
+            out, inp = self._default_transfer()
+            H, _ = self._transfer(out, inp)
         except SolverError:
-            so = None
-        if so is not None:
-            text, _ = self._record(q, so["BW"], "Hz")
-            self.trace.add("Bandwidth", so["BW_eq"], f"BW = {text}")
+            return None
+        r = analyse(H)
+        self._resp = r
+        if r is None or r.kind == "other":
+            return r
+        parts = [f"K = {self._val(r.K)} ({K_MEANING[r.kind]})"]
+        if r.order == 1:
+            parts.append(f"ωc = {self._val(r.w0, 'rad/s')} (fc = ωc/2π = {self._val(r.w0 / (2 * sp.pi), 'Hz')})")
+        elif r.order == 2:
+            parts.append(f"ω0 = {self._val(r.w0, 'rad/s')} (f0 = ω0/2π = {self._val(r.w0 / (2 * sp.pi), 'Hz')})")
+            al = alignment(r.Q)
+            parts.append(f"Q = {self._val(r.Q)}" + (f" ({al})" if al else ""))
+        # a first-order fc is already shown by the "single pole" step, so this is a key step only when asked
+        level = "key" if r.order != 1 or any(self._kind(q)[0] == "filter" for q in self.queries) else "full"
+        self.trace.add(f"Identify the filter: H(s) has the {r.label} form", r.standard, ";  ".join(parts),
+                       level=level)
+        if r.order == 2:
+            self._formula_step(out, inp, r)
+        return r
+
+    def _formula_step(self, out: str, inp: str, r: Response) -> None:
+        """Re-solve the circuit with every R, L, C kept as a symbol to get THIS circuit's own design
+        formulas for ω0, Q and K (e.g. Sallen-Key ω0 = 1/√(R1·R2·C1·C2)). Nothing is hard-coded per
+        topology. Skipped when it cannot be done cleanly (non-ideal op-amps, symbolic values already,
+        or a formula too long to be useful)."""
+        passive = [c for c in self.nl.components if c.type.value in ("R", "L", "C")]
+        if any(info is not None for info in self.opamps.values()) or not passive \
+                or any(is_symbolic(str(c.value)) for c in passive) \
+                or not all(re.fullmatch(r"[A-Za-z]\w*", c.id) for c in passive):
             return
+        try:
+            comps = [c.model_copy(update={"value": c.id}) if c.type.value in ("R", "L", "C") else c
+                     for c in self.nl.components]
+            drv = self._driver(inp)
+            ov = {c.id: (1 if c.id == drv.id else 0) for c in self.indep}
+            m = MNA(comps, "ac", overrides=ov, conventions=self.conv)
+            m.solve()
+            vout = m.evaluate(m.V[out])
+            H = vout / m.evaluate(m.V[inp]) if inp in self.node_set else vout
+            rs = analyse(H)
+        except (SolverError, ZeroDivisionError, ValueError):
+            return
+        if rs is None or rs.kind != r.kind or rs.order != 2:
+            return
+        _, a1, a0 = rs.a                          # monic: s² + a1·s + a0
+        P = sp.factor(sp.simplify(1 / a0))         # ω0² = 1/P
+        M = sp.factor(sp.simplify(a1 * P))         # Q = √P / M
+        pn, pd = sp.fraction(P)
+        w0_txt = f"1/√({pretty(pn)})" if pd == 1 else f"√(({pretty(pd)})/({pretty(pn)}))"
+        mn, md = sp.fraction(M)
+        q_txt = f"√({pretty(P)})/({pretty(mn)})" if md == 1 else f"√({pretty(P)})·{paren(pretty(md))}/({pretty(mn)})"
+        k_txt = pretty(sp.factor(sp.simplify(rs.K)))
+        eq = f"ω0 = {w0_txt},   Q = {q_txt},   K = {k_txt}"
+        if len(eq) > 220:
+            return
+        self.res.symbolic["formula.w0"] = str(sp.sqrt(1 / P))
+        self.res.symbolic["formula.Q"] = str(sp.sqrt(P) / M)
+        self.res.symbolic["formula.K"] = str(rs.K)
+        self.trace.add("Design formulas of this circuit (from its symbolic H(s), every R and C kept as a letter)",
+                       eq.replace("*", "·"), "f0 = ω0/(2π); substituting the values gives the numbers above")
+
+    def _q_filter(self, q, kind, a, b):
+        r = self._response()
+        if r is None:
+            raise SolverError("No frequency-dependent transfer function, so this is not a filter")
+        if r.kind == "other":
+            out, inp = self._default_transfer()
+            H, _ = self._transfer(out, inp)
+            self.res.answers[q] = f"{r.label}: H(s) = {pretty(H, self.sig)}"
+            self.res.numeric[q] = None
+            return
+        parts = [r.label, f"K = {self._val(r.K)}"]
+        if r.K is not None and not sp.sympify(r.K).free_symbols:
+            k = complex(sp.N(r.K))
+            self.res.numeric[q + ".K"] = k.real
+            if abs(k) > 0:
+                parts[-1] += f" ({fmt_num(20 * math.log10(abs(k)), self.sig)} dB)"
+        if r.order == 1:
+            f = r.w0 / (2 * sp.pi)
+            parts.append(f"fc = {self._val(f, 'Hz')}")
+            if not f.free_symbols:
+                self.res.numeric[q + ".fc"] = float(sp.N(f))
+        elif r.order == 2:
+            f = r.w0 / (2 * sp.pi)
+            parts.append(f"f0 = {self._val(f, 'Hz')}")
+            al = alignment(r.Q)
+            parts.append(f"Q = {self._val(r.Q)}" + (f" ({al.split(':')[0]})" if al else ""))
+            if not f.free_symbols:
+                self.res.numeric[q + ".f0"] = float(sp.N(f))
+            if r.Q != sp.oo and not sp.sympify(r.Q).free_symbols:
+                self.res.numeric[q + ".Q"] = float(sp.N(r.Q))
+        out, inp = self._default_transfer()          # H(0) too: "DC gain" asked as "filter" (K for a low-pass)
+        H, _ = self._transfer(out, inp)
+        _, den = sp.fraction(sp.cancel(sp.together(H)))
+        if den.subs(s, 0) != 0:
+            h0 = H.subs(s, 0)
+            if not h0.free_symbols:
+                self.res.numeric[q + ".dc_gain"] = float(sp.re(sp.N(h0)))
+        self.res.answers[q] = ";  ".join(parts)
+        self.res.numeric[q] = None
+        self.res.symbolic[q + ".type"] = r.kind
+
+    def _q_bw(self, q, kind, a, b):
+        resp = self._response()
+        if resp is not None and resp.kind == "high-pass":
+            raise SolverError("A high-pass filter passes every frequency above fc, so its bandwidth is not "
+                              "finite; ask for the cutoff frequency fc instead")
+        if resp is None or resp.kind != "low-pass":
+            try:
+                so = self._second_order()
+            except SolverError:
+                so = None
+            if so is not None:                       # band-pass / notch: BW = f0/Q, exact
+                text, _ = self._record(q, so["BW"], "Hz")
+                self.trace.add("Bandwidth", so["BW_eq"], f"BW = {text}")
+                return
         out, inp = self._default_transfer()
         H, _ = self._transfer(out, inp)
-        cuts, hmax = self._cutoffs(H)
-        if len(cuts) == 1 and self._is_lowpass(H, hmax):
+        ref, _ = self._reference(H, resp)
+        cuts, hmax = self._cutoffs(H, ref)
+        hmax = ref or hmax
+        if len(cuts) == 1 and ((resp is not None and resp.kind == "low-pass") or self._is_lowpass(H, hmax)):
             # low-pass (e.g. an op-amp amplifier limited by GBW): the band is 0 → fc, so BW = fc
             fc = cuts[0]
             self.trace.add("Low-pass response: the pass band runs from DC to the −3 dB point",
-                           f"|H|max = |H(0)| = {fmt_num(hmax, self.sig)}  →  solve |H(j2πf)| = "
+                           f"pass-band gain |H(0)| = {fmt_num(hmax, self.sig)}  →  solve |H(j2πf)| = "
                            f"{fmt_num(hmax, self.sig)}/√2 = {fmt_num(hmax / math.sqrt(2), self.sig)}")
             text, _ = self._record(q, sp.Float(fc), "Hz")
             self.trace.add("Bandwidth = fc − 0", None, f"BW = {text}")

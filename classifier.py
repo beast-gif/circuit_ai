@@ -30,14 +30,15 @@ TOPICS = ["dc", "ac", "transient", "small_signal", "filter", "oscillator",
           "opamp", "bjt", "mosfet", "diode", "conceptual"]
 DEVICE_TOPIC = {"OPAMP": "opamp", "Q": "bjt", "M": "mosfet", "D": "diode"}
 DEVICE_LABEL = {"opamp": "an op-amp", "bjt": "a BJT", "mosfet": "a MOSFET", "diode": "a diode"}
-FILTER_QUERIES = {"fc", "poles", "zeros", "Qfactor", "bandwidth"}
+FILTER_QUERIES = {"fc", "poles", "zeros", "Qfactor", "bandwidth", "filter"}
 
 WORDS = {
     "oscillator": ["oscillat", "barkhausen", "wien", "colpitts", "hartley", "crystal oscillator",
                    "frequency of oscillation"],
     "filter": ["filter", "cutoff", "cut-off", "corner frequency", "-3 db", "−3 db", "3 db", "3db", "bode",
                "low-pass", "low pass", "lowpass", "high-pass", "high pass", "highpass",
-               "band-pass", "band pass", "bandpass", "notch", "band-stop", "bandstop"],
+               "band-pass", "band pass", "bandpass", "notch", "band-stop", "bandstop",
+               "sallen", "multiple feedback", "multiple-feedback", "mfb", "butterworth", "chebyshev", "bessel"],
     "opamp": ["op-amp", "op amp", "opamp", "operational amplifier", "741", "non-inverting",
               "inverting amplifier", "voltage follower", "unity-gain buffer"],
     "bjt": ["bjt", "npn", "pnp", "common emitter", "common-emitter", "common collector",

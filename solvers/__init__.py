@@ -7,8 +7,9 @@ from typing import Dict, List
 from schemas import Netlist, SolveResult
 from solvers.base import BaseSolver, NotSupportedError, SolverError
 from solvers.dc_ac import DCACSolver
+from solvers.diode import DiodeSolver
 
-SOLVERS: List[BaseSolver] = [DCACSolver()]
+SOLVERS: List[BaseSolver] = [DiodeSolver(), DCACSolver()]
 
 
 def get_solver(nl: Netlist) -> BaseSolver:

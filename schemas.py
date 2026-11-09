@@ -112,7 +112,9 @@ class Component(BaseModel):
             raise ValueError(f"{self.id}: type {t} needs {NODE_COUNT[t]} nodes, got {len(self.nodes)}")
         if t in NEEDS_VALUE and self.value in (None, ""):
             raise ValueError(f"{self.id}: type {t} needs a value")
-        if t in {"V", "I"} and self.value in (None, "") and self.ac in (None, ""):
+        wave = {str(k).strip().lower() for k in (self.params or {})} & {
+            "vrms", "rms", "irms", "vpp", "ipp", "vp", "vpeak", "vm", "peak"}     # a sinusoid given as RMS / p-p
+        if t in {"V", "I"} and self.value in (None, "") and self.ac in (None, "") and not wave:
             raise ValueError(f"{self.id}: source needs a DC value or an AC magnitude")
         if t in {"F", "H"} and not self.control:
             raise ValueError(f"{self.id}: {t} source needs 'control' (id of controlling source)")

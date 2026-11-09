@@ -37,7 +37,7 @@ TYPE_ALIASES: Dict[str, tuple] = {
     "dc_voltage_source": ("V", None), "ac_voltage_source": ("V", None), "vs": ("V", None),
     "current_source": ("I", None), "isource": ("I", None),
     "dc_current_source": ("I", None), "ac_current_source": ("I", None),
-    "diode": ("D", None),
+    "diode": ("D", None), "zener": ("D", "zener"), "zener_diode": ("D", "zener"), "led": ("D", "led"),
     "bjt": ("Q", None), "transistor": ("Q", None), "npn": ("Q", "NPN"), "pnp": ("Q", "PNP"),
     "mosfet": ("M", None), "nmos": ("M", "NMOS"), "pmos": ("M", "PMOS"),
     "opamp": ("OPAMP", "ideal"), "op_amp": ("OPAMP", "ideal"),
@@ -54,9 +54,15 @@ NODE_KEY_ORDERS = [
 ]
 
 QUERY_NAMES = {"v": "V", "i": "I", "p": "P", "z": "Z", "h": "H", "rth": "Rth", "vth": "Vth",
-               "zth": "Zth", "isc": "Isc", "rn": "Rn", "in": "In", "bias": "bias"}
+               "zth": "Zth", "isc": "Isc", "rn": "Rn", "in": "In", "bias": "bias",
+               "vmax": "Vmax", "vpeak": "Vmax", "vp": "Vmax", "vmin": "Vmin", "vavg": "Vavg", "vdc": "Vavg",
+               "vrms": "Vrms", "vtc": "vtc", "imax": "Imax", "ipeak": "Imax", "iavg": "Iavg", "idc": "Iavg",
+               "irms": "Irms", "piv": "PIV", "prv": "PIV", "conduction": "conduction",
+               "conduction_angle": "conduction", "vripple": "Vripple", "vr": "Vripple", "vpp": "Vpp",
+               "ripple": "ripple", "ripple_factor": "ripple", "rf": "ripple"}
 BARE_NAMES = {"rin": "Rin", "rout": "Rout", "gain": "gain", "fc": "fc", "f0": "f0", "poles": "poles",
-              "zeros": "zeros", "tau": "tau", "qfactor": "Qfactor", "bandwidth": "bandwidth"}
+              "zeros": "zeros", "tau": "tau", "qfactor": "Qfactor", "bandwidth": "bandwidth",
+              "filter": "filter", "filter_type": "filter", "type": "filter", "response": "filter"}
 
 
 @dataclass
@@ -187,7 +193,7 @@ def normalize(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 ANALYSES = {"dc", "ac", "transient", "small_signal", "conceptual"}
-_AC_KINDS = {"fc", "f0", "poles", "zeros", "Qfactor", "bandwidth", "H", "gain"}
+_AC_KINDS = {"fc", "f0", "poles", "zeros", "Qfactor", "bandwidth", "H", "gain", "filter"}
 
 
 def infer_analysis(data: Dict[str, Any]) -> Optional[str]:
@@ -199,8 +205,11 @@ def infer_analysis(data: Dict[str, Any]) -> Optional[str]:
         return None
     kinds = {re.match(r"^(\w+)", q).group(1) for q in data.get("query") or [] if re.match(r"^(\w+)", q)}
     types = {str(c.get("type", "")) for c in comps}
-    if "tau" in kinds:
+    if "tau" in kinds or kinds & {"Vmax", "Vmin", "Vavg", "Vrms", "vtc", "Imax", "Iavg", "Irms", "PIV", "conduction",
+                                  "Vripple", "Vpp", "ripple"}:
         return "transient"
+    if "D" in types and any(c.get("ac") not in (None, "") for c in comps):
+        return "transient"                      # a diode with a sinusoidal input: rectifier / clipper
     if types & {"Q", "M"} and kinds & {"Rin", "Rout", "gain"}:
         return "small_signal"
     if kinds & _AC_KINDS or data.get("frequency") or any(c.get("ac") not in (None, "") for c in comps):
@@ -315,6 +324,9 @@ def consistency_errors(question: str, nl: Netlist) -> List[str]:
     errors += _dangling_errors(question, nl)
     errors += _added_element_errors(question, nl)
     errors += _opamp_errors(question, nl)
+    errors += _filter_errors(question, nl)
+    errors += _loop_errors(question, nl)
+    errors += _diode_errors(question, nl)
     return errors
 
 
@@ -401,6 +413,88 @@ def _opamp_errors(question: str, nl: Netlist) -> List[str]:
     return errors
 
 
+# ----------------------------------------------------------------------
+# Filter checks (Phase 2, step 4)
+# ----------------------------------------------------------------------
+_SALLEN = re.compile(r"sallen[\s-]*key", re.IGNORECASE)
+_MFB = re.compile(r"multiple[\s-]*feedback|\bmfb\b|deliyannis|\brauch\b", re.IGNORECASE)
+_TYPE_WORDS = [("low-pass", re.compile(r"\blow[\s-]?pass\b", re.IGNORECASE)),
+               ("high-pass", re.compile(r"\bhigh[\s-]?pass\b", re.IGNORECASE)),
+               ("band-pass", re.compile(r"\bband[\s-]?pass\b", re.IGNORECASE)),
+               ("notch", re.compile(r"\bnotch\b|\bband[\s-]?(?:stop|reject)\b", re.IGNORECASE))]
+_TYPE_HINT = {
+    "low-pass": "a low-pass has a CONSTANT numerator: series resistors (or inductors) carry the signal and "
+                "capacitors go to ground or back to the output",
+    "high-pass": "a high-pass has s (or s²) alone in the numerator: series capacitors carry the signal and "
+                 "resistors go to ground or back to the output",
+    "band-pass": "a band-pass has s alone in the numerator: it blocks both DC and high frequencies",
+    "notch": "a notch has (s² + ω0²) in the numerator: it blocks one frequency and passes DC and high frequencies",
+}
+
+
+def _out_feedback(nl: Netlist, u) -> List[str]:
+    """Nodes (other than ground and the op-amp's own input pins) joined to the output by one passive element."""
+    out, inp, inm = u.nodes
+    nodes = []
+    for c in nl.components:
+        if c.type.value in _PASSIVE and out in c.nodes:
+            other = c.nodes[1] if c.nodes[0] == out else c.nodes[0]
+            if other not in ("0", inp, inm, out):
+                nodes.append(other)
+    return nodes
+
+
+def _parsed_response(nl: Netlist):
+    """Filter type of the parsed netlist (same solver code as the answer), or None if it cannot be found."""
+    try:
+        from llm_client import load_conventions
+        from solvers.dc_ac import _Job
+        from solvers.filters import analyse
+
+        job = _Job(nl, load_conventions())
+        out, inp = job._default_transfer()
+        H, _ = job._transfer(out, inp)
+        return analyse(H)
+    except Exception:          # any problem here is not the parser's fault: no feedback, no blocking
+        return None
+
+
+def _filter_errors(question: str, nl: Netlist) -> List[str]:
+    errors: List[str] = []
+    ops = [c for c in nl.components if c.type.value == "OPAMP"]
+    if _SALLEN.search(question):
+        if not ops:
+            errors.append("A Sallen-Key filter is built around an op-amp (often a unity-gain follower); add it "
+                          "with nodes ['out', 'p', 'out'] or ['out', 'p', 'n1'] with gain resistors.")
+        elif all(_to_ground_only(nl, u.nodes[1], u.id) for u in ops):
+            errors.append("In a Sallen-Key filter the signal reaches the op-amp's + input through the RC network "
+                          "(the + input is NOT grounded). Use the Sallen-Key template.")
+        elif not any(_out_feedback(nl, u) for u in ops):
+            errors.append("A Sallen-Key filter has a positive-feedback element from the junction 'a' of the first "
+                          "two input elements to the OUTPUT (C1 in the low-pass, R1 in the high-pass). Here no "
+                          "element joins the output to such a node.")
+    if _MFB.search(question):
+        if not ops:
+            errors.append("A multiple-feedback (MFB) filter is built around an op-amp; add it with nodes "
+                          "['out', '0', 'n1'].")
+        elif not any(_to_ground_only(nl, u.nodes[1], u.id) for u in ops):
+            errors.append("In a multiple-feedback (MFB) filter the op-amp's + input is grounded and the signal "
+                          "reaches the − input. Use the MFB template.")
+        elif not any(_out_feedback(nl, u) and _has_feedback(nl, u.nodes[0], u.nodes[2]) for u in ops):
+            errors.append("A multiple-feedback (MFB) filter has TWO feedback paths from the output: one element to "
+                          "the − input and one to node 'a' (the junction after the input element).")
+
+    # the response the question names must be the response of the parsed circuit
+    named = [kind for kind, pat in _TYPE_WORDS if pat.search(question)]
+    if len(named) == 1 and not errors and (ops or any(c.type.value in ("C", "L") for c in nl.components)):
+        resp = _parsed_response(nl)
+        if resp is not None and resp.kind not in ("other", named[0]):
+            errors.append(f"The question describes a {named[0]} filter, but the circuit you built has a "
+                          f"{resp.kind} response. Remember: {_TYPE_HINT[named[0]]}. Re-check which elements are "
+                          f"in series with the signal and which go to ground or to the output.")
+    return errors
+
+
 def _dangling_errors(question: str, nl: Netlist) -> List[str]:
     """A node touched by only ONE element is an open end: no current can flow through that element.
     Fine for a terminal being measured (Thevenin 'a'), almost always a parse mistake otherwise
@@ -431,7 +525,138 @@ def _dangling_errors(question: str, nl: Netlist) -> List[str]:
         errors.append(f'Node {n} connects only to {ids[0]}, so no current can flow through {ids[0]} (an open end). '
                       f'If {ids[0]} is part of a loop or series path, connect its other end to the rest of the '
                       f'circuit (often ground "0").')
+    errors += _dead_end_errors(question, nl, conn)
     return errors
+
+
+def _dead_end_errors(question: str, nl: Netlist, conn: Dict[str, List[str]]) -> List[str]:
+    """A node whose elements ALL go to one and the same other node is a dead end too: e.g. "R1 in series
+    with the parallel combination of R2 and R3" parsed as R2, R3 both n1–out with "out" connected to nothing
+    else. No current flows through R2 and R3, so every voltage across them is 0. Only Thevenin / impedance
+    terminals are exempt (there the open end is the point of the question)."""
+    by_id = {c.id: c for c in nl.components}
+    terminals = set()
+    for q in nl.query:
+        m = _PORT_QUERY.match(q.replace(" ", ""))
+        if m:
+            terminals |= {m.group(2), m.group(3)}
+    errors = []
+    for n, ids in conn.items():
+        if n == "0" or len(ids) < 2 or n in terminals:
+            continue
+        comps = [by_id[i] for i in ids]
+        if not all(c.type.value in _PASSIVE for c in comps):
+            continue
+        others = {c.nodes[1] if c.nodes[0] == n else c.nodes[0] for c in comps}
+        if len(others) != 1:
+            continue
+        if re.search(rf"\b(?:terminal|point)s?\s+(?:\w+\s+(?:and|to|-)\s+)?{re.escape(n)}\b", question, re.I):
+            continue
+        m = others.pop()
+        names = ", ".join(ids)
+        errors.append(f'Node {n} is reached only through {names}, which all connect it to node {m} and to nothing '
+                      f'else, so no current flows through them (the voltage across them would always be 0). '
+                      f'Elements "in parallel" share BOTH nodes with the rest of the circuit: e.g. a parallel '
+                      f'combination in series after R1 goes from R1\'s far node to ground, ["{m}", "0"].')
+    return errors
+
+
+# "A 6 V source in series with a 2 kOhm resistor forms a loop": those two parts close a loop on their own
+_LOOP = re.compile(r"\bforms?\s+(?:a\s+)?(?:closed\s+)?loop\b", re.IGNORECASE)
+_V_IN_TEXT = re.compile(r"(\d+(?:\.\d+)?)\s*V\b")
+_R_IN_TEXT = re.compile(r"(\d+(?:\.\d+)?)\s*(k|K|M|Meg|m)?\s*(?:Ohm|ohm|Ω)")
+
+
+def _loop_errors(question: str, nl: Netlist) -> List[str]:
+    errors = []
+    for sentence in re.split(r"(?<=[.!?;])\s+", question):
+        if not _LOOP.search(sentence):
+            continue
+        vs = {float(x) for x in _V_IN_TEXT.findall(sentence)}
+        rs = {parse_value(a + (b or "")) for a, b in _R_IN_TEXT.findall(sentence)}
+        if len(vs) != 1 or len(rs) != 1:
+            continue
+        v, r = vs.pop(), rs.pop()
+        vc = [c for c in nl.components if c.type.value == "V" and not _is_zero(c.value) and _num_eq(c.value, v)]
+        rc = [c for c in nl.components if c.type.value == "R" and _num_eq(c.value, r)]
+        if len(vc) == 1 and len(rc) == 1 and set(rc[0].nodes) != set(vc[0].nodes):
+            errors.append(f"The question says the {v:g} V source and the resistor {rc[0].id} form a loop on their "
+                          f"own: {rc[0].id} must connect the source's two terminals, nodes {vc[0].nodes}. Here it "
+                          f"is {rc[0].nodes}. A current I in that loop that controls a dependent source does NOT "
+                          f"mean the loop is wired to the dependent source's node; that is a separate part.")
+    return errors
+
+
+# ----------------------------------------------------------------------
+# Diode checks (Phase 3)
+# ----------------------------------------------------------------------
+_ZENER = re.compile(r"\bzener\b", re.IGNORECASE)
+_IDEAL_DIODE = re.compile(r"\bideal\s+(?:silicon\s+)?diodes?\b|\bdiodes?\s+(?:is|are)\s+ideal\b", re.IGNORECASE)
+_FORWARD = re.compile(r"\bforward", re.IGNORECASE)
+
+
+def _is_zener(c) -> bool:
+    return "zener" in (c.model or "").lower() or any(str(k).lower() in ("vz", "bv", "vbr", "v_z")
+                                                       for k in (c.params or {}))
+
+
+def _diode_errors(question: str, nl: Netlist) -> List[str]:
+    ds = [c for c in nl.components if c.type.value == "D"]
+    if not ds:
+        return []
+    errors: List[str] = []
+    if _ZENER.search(question):
+        zs = [c for c in ds if _is_zener(c)]
+        if not zs:
+            errors.append('The question has a Zener diode: give it "model": "zener" and its Zener voltage in '
+                          'params, e.g. {"VZ": 5.1}.')
+        elif not _FORWARD.search(question):
+            for z in zs:
+                if z.nodes[1] == "0" and z.nodes[0] != "0":
+                    errors.append(f"{z.id} is a Zener working in breakdown, so it is REVERSE-connected: cathode on "
+                                  f"the regulated (+) node and anode at ground -> nodes ['0', '{z.nodes[0]}']. "
+                                  f"Remember the order is ['anode', 'cathode'].")
+    if _IDEAL_DIODE.search(question) and not all((c.model or "").lower() == "ideal" for c in ds if not _is_zener(c)):
+        errors.append('The question says the diodes are ideal: set "model": "ideal" on each of them.')
+    errors += _rectifier_errors(question, nl, ds)
+    return errors
+
+
+_RMS_IN_TEXT = re.compile(r"(\d+(?:\.\d+)?)\s*V\s*(?:\(\s*)?(?:rms|RMS|r\.m\.s\.)", re.IGNORECASE)
+_PP_IN_TEXT = re.compile(r"(\d+(?:\.\d+)?)\s*V\s*(?:peak[- ]to[- ]peak|p-p|pp)\b", re.IGNORECASE)
+_BRIDGE = re.compile(r"\bbridge\b", re.IGNORECASE)
+_CTAP = re.compile(r"cent(?:er|re)[- ]?tap", re.IGNORECASE)
+
+
+def _rectifier_errors(question: str, nl: Netlist, ds) -> List[str]:
+    if nl.analysis.value != "transient":
+        return []
+    errors: List[str] = []
+    waves = [c for c in nl.components if c.type.value in ("V", "I") and (
+        c.ac not in (None, "") or {str(k).lower() for k in (c.params or {})} & {"vrms", "rms", "vpp", "vp", "vpeak"})]
+    # an RMS or peak-to-peak value put straight into "ac" (which means PEAK) gives a wrong amplitude
+    for pat, key in ((_RMS_IN_TEXT, "Vrms"), (_PP_IN_TEXT, "Vpp")):
+        for mtxt in pat.finditer(question):
+            x = float(mtxt.group(1))
+            for c in waves:
+                if c.ac not in (None, "") and _num_eq(c.ac, x):
+                    errors.append(f'{x:g} V in the question is a{"n RMS" if key == "Vrms" else " peak-to-peak"} '
+                                  f'value, but {c.id} has "ac": "{c.ac}" (which means the PEAK). Use params '
+                                  f'{{"{key}": {x:g}}} instead of "ac".')
+    if _BRIDGE.search(question) and len(ds) != 4:
+        errors.append(f"A bridge rectifier has FOUR diodes (D1 a→out, D2 b→out, D3 0→a, D4 0→b with the source "
+                      f"between a and b); the netlist has {len(ds)}.")
+    if _CTAP.search(question) and len(waves) != 2:
+        errors.append("A centre-tapped secondary is TWO equal sinusoidal halves with the centre tap at ground "
+                      "(V1 ['a','0'] and V2 ['0','b'], each with half the total voltage).")
+    return errors
+
+
+def _num_eq(raw: Optional[str], x: float) -> bool:
+    try:
+        return abs(parse_value(raw) - x) <= 1e-9 * max(abs(x), 1e-30)
+    except (ValueError, TypeError):
+        return False
 
 
 _PORT_QUERY = re.compile(r"^(Z|Zth|Rth|Rn|Isc|In|Vth)\((\w+),(\w+)\)$")
@@ -454,10 +679,16 @@ def _added_element_errors(question: str, nl: Netlist) -> List[str]:
     # a 0 V voltage source is a short / ammeter the question never describes
     if not re.search(r"\b0\s*v\b|\bzero[- ]volt|\bshort", q):
         for c in nl.components:
-            if c.type.value == "V" and _is_zero(c.value) and _is_zero(c.ac):
+            # (a sinusoid given only as params {"Vrms": ..} / {"Vpp": ..} has no value and no ac: not a short)
+            wave = {str(k).strip().lower() for k in (c.params or {})} & {
+                "vrms", "rms", "vpp", "vp", "vpeak", "vm", "peak"}
+            if c.type.value == "V" and _is_zero(c.value) and _is_zero(c.ac) and not wave:
                 errors.append(f"{c.id} is a 0 V source (a short) that the question does not describe. "
                               "Remove it: use Isc(a,b) for a short-circuit current and I(X) for a current; "
                               "the solver adds shorts and test sources itself.")
+
+    sources = [c for c in nl.components if c.type.value in ("V", "I")]
+    needs_input = [x for x in nl.query if re.match(r"^(H\(|gain$|Rin$|fc$|bandwidth$|filter$)", x)]
 
     # a voltage source straight across the terminals being measured forces Z = 0 / Isc undefined
     for qry in nl.query:
@@ -467,9 +698,21 @@ def _added_element_errors(question: str, nl: Netlist) -> List[str]:
         ends = {m.group(2), m.group(3)}
         for c in nl.components:
             if c.type.value == "V" and set(c.nodes[:2]) == ends:
-                errors.append(f"{c.id} is connected directly across the terminals of {qry}. With sources turned "
-                              f"off it becomes a short, so the answer would be 0. If the question does not "
-                              f"describe this source, remove it.")
+                if needs_input and len(sources) == 1:
+                    # the source IS needed (as the input of the gain); the port query is the wrong one
+                    errors.append(f"Keep {c.id}: it is the input for {', '.join(needs_input)}. For the input "
+                                  f"resistance use the query \"Rin\" instead of {qry} (Rin removes the input source "
+                                  f"by itself; {qry} would short it and give 0).")
+                else:
+                    errors.append(f"{c.id} is connected directly across the terminals of {qry}. With sources "
+                                  f"turned off it becomes a short, so the answer would be 0. If the question does "
+                                  f"not describe this source, remove it.")
+
+    # a gain / transfer-function / input-resistance question needs an input source to work with
+    if needs_input and not sources:
+        errors.append(f"{', '.join(needs_input)} needs an input source, but the netlist has none. Add one: "
+                      f'{{"id": "V1", "type": "V", "nodes": ["in", "0"], "value": "1"}} (or "ac": "1" for a '
+                      f"frequency response), at the node where the signal enters.")
     return errors
 
 
