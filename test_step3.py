@@ -165,15 +165,18 @@ def symbolic_and_error_checks() -> bool:
         good = abs(float(val) - 20 / 3) < 1e-9
     ok &= check("symbolic V(out) = R2·Vs/(R1+R2)", good, f"got {sym}")
 
-    # BJT -> not supported until Phase 3 (op-amps became supported in Phase 2)
-    bjt = net([C("V1", "V", ["vcc", "0"], "12"), C("RC", "R", ["vcc", "c"], "1k"), C("RB", "R", ["vcc", "b"], "100k"),
-               Component(id="Q1", type="Q", nodes=["c", "b", "0"], model="NPN")],
-              ["V(c)"], question="Find the collector voltage of the BJT.")
+    # a transistor circuit with a time-varying input is still out of scope (devices themselves are solved
+    # in Phase 3: diodes P3-1/P3-2, BJTs P3-3/P3-4, MOSFETs P3-5)
+    tran = net([C("V1", "V", ["vdd", "0"], "12"), C("RD", "R", ["vdd", "d"], "1k"),
+                C("VG", "V", ["g", "0"], ac="1"), C("C1", "C", ["g", "0"], "1u"),
+                Component(id="M1", type="M", nodes=["d", "g", "0"], model="NMOS",
+                          params={"k": 0.5e-3, "Vt": 1})],
+               ["Vmax(d)"], analysis="transient", question="Sketch the drain waveform.")
     try:
-        get_solver(bjt)
-        ok &= check("BJT -> NotSupportedError (Phase 3)", False)
+        get_solver(tran)
+        ok &= check("transistor + time-varying input -> NotSupportedError", False)
     except NotSupportedError as e:
-        ok &= check("BJT -> NotSupportedError (Phase 3)", "Phase 3" in str(e), str(e))
+        ok &= check("transistor + time-varying input -> NotSupportedError", "not supported yet" in str(e), str(e))
 
     # node joined only through capacitors in DC -> undefined
     caps = net([C("V1", "V", ["a", "0"], "10"), C("R1", "R", ["a", "0"], "1k"),

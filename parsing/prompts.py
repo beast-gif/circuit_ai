@@ -120,6 +120,118 @@ RECTIFIERS AND CLIPPERS (analysis "transient", a sinusoidal input)
 - Ripple (peak-to-peak) -> "Vripple(out)"; ripple factor -> "ripple(out)"; DC output -> "Vavg(out)";
   peak (repetitive surge) diode current -> "Imax(D1)"; conduction angle -> "conduction(D1)".
 
+BJT RULES (type "Q", nodes ["collector", "base", "emitter"] in exactly that order)
+- "model": "NPN" or "PNP". Give params {"beta": 100} whenever β / hFE is stated; {"VBE": 0.6} or
+  {"VCEsat": 0.3} only if the question gives a different value (defaults 0.7 V and 0.2 V).
+- Supplies are voltage sources to ground: VCC {"nodes": ["vcc", "0"], "value": "12"}; a negative supply
+  -VEE {"nodes": ["vee", "0"], "value": "-10"}. An emitter "grounded" means its node is "0".
+- Bias templates (NPN):
+    fixed bias          : RB ["vcc","b"], RC ["vcc","c"], Q1 ["c","b","0"]
+    emitter-stabilised  : RB ["vcc","b"], RC ["vcc","c"], RE ["e","0"], Q1 ["c","b","e"]
+    voltage-divider     : R1 ["vcc","b"], R2 ["b","0"], RC ["vcc","c"], RE ["e","0"], Q1 ["c","b","e"]
+    collector-feedback  : RB ["c","b"], RC ["vcc","c"], Q1 ["c","b","0"] (+ RE ["e","0"] if given)
+    dual-supply emitter : RB ["b","0"], RC ["vcc","c"], RE ["e","vee"], Q1 ["c","b","e"]
+  PNP: the emitter goes toward the POSITIVE supply and the collector toward ground, e.g. RE ["vcc","e"],
+  RC ["c","0"], RB ["b","0"], Q1 ["c","b","e"] with "model": "PNP".
+- For a DC bias (Q-point) question use analysis "dc"; leave out coupling / bypass capacitors and the AC
+  signal source (capacitors are open circuits in DC).
+- Queries: Q-point / operating point / region -> "bias(Q1)"; "IC(Q1)", "IB(Q1)", "IE(Q1)", "VCE(Q1)"
+  (PNP: "VEC(Q1)"), "VBE(Q1)"; node voltages "V(c)", "V(e)", "V(b)"; transistor power "P(Q1)".
+
+BJT AMPLIFIER RULES (small-signal: gain, Rin, Rout)
+- Use analysis "small_signal" and KEEP everything: the bias resistors, the supply, the coupling and bypass
+  capacitors, and the signal source with an AC magnitude ("ac": "1" when the question gives no amplitude;
+  put the real amplitude there if it does). The solver finds the DC bias with the capacitors open and then
+  the small-signal gain with them shorted, so do not remove or short anything yourself.
+- Templates (NPN, the divider-biased stages; "in" is where the signal enters):
+    common emitter          : R1 ["vcc","b"], R2 ["b","0"], RC ["vcc","c"], RE ["e","0"], Q1 ["c","b","e"],
+                              V1 ["in","0"] ac, C1 ["in","b"], CE ["e","0"] (the bypass, only if the question
+                              has one), and for a load C2 ["c","out"] + RL ["out","0"]
+    emitter follower        : the same without RC (collector straight to "vcc": Q1 ["vcc","b","e"]) and the
+                              output at the emitter: C2 ["e","out"], RL ["out","0"]
+    common base             : the common-emitter network plus CB ["b","0"] (the base bypass) and the signal
+                              into the emitter: V1 ["in","0"] ac, C1 ["in","e"]
+  A source resistance goes between the source and the coupling capacitor: V1 ["s","0"] ac, RS ["s","in"].
+- Queries: voltage gain / Av -> "gain"; input resistance -> "Rin"; output resistance -> "Rout";
+  gm, r_pi (r_π), r_e, r_o of a transistor -> "gm(Q1)", "rpi(Q1)", "re(Q1)", "ro(Q1)". The Q-point of the
+  amplifier -> "bias(Q1)". Lower cutoff frequency of the amplifier -> "fc" (the capacitors are then kept).
+- "Mid-band" / "the capacitors are large" is the normal case and needs nothing special.
+- Every capacitor needs a NUMBER in "value". If the question says a resistor is "bypassed" or that the
+  signal is "coupled" but gives no capacitance, use "100u" for a bypass capacitor and "10u" for a coupling
+  one and add e.g. "bypass capacitor value not given: 100 uF assumed" to "assumptions". Never put a word
+  like "bypass", "large" or "coupling" in "value".
+
+MOSFET RULES (type "M", nodes ["drain", "gate", "source"] in exactly that order)
+- "model": "NMOS" or "PMOS". params MUST give the conduction parameter and the threshold:
+    {"k": 0.5e-3, "Vt": 1}        k = µCox·W/L in A/V², used as I_D = ½·k·(V_GS − V_t)²
+    {"kprime": 0.1e-3, "WL": 5}   k' with W/L instead (k = k'·W/L); "W" and "L" also work
+    {"K2": 0.25e-3, "Vt": 1}      ONLY when the question writes I_D = K·(V_GS − V_t)² with NO ½
+  Channel-length modulation: {"lambda": 0.02} or {"VA": 50}. Leave it out when the question ignores it.
+  V_t of a PMOS is given as a magnitude (the sign comes from "model": "PMOS").
+- Bias templates (NMOS; the gate draws no DC current, so the gate divider carries none):
+    fixed / divider gate : R1 ["vdd","g"], R2 ["g","0"], RD ["vdd","d"], RS ["s","0"], M1 ["d","g","s"]
+    diode-connected      : RD ["vdd","d"], M1 ["d","d","0"]   (gate tied to the drain)
+    source-follower      : R1 ["vdd","g"], R2 ["g","0"], RS ["s","0"], M1 ["vdd","g","s"]
+  PMOS: the source goes to the positive supply, e.g. RS ["vdd","s"], RD ["d","0"], M1 ["d","g","s"].
+- Amplifiers (analysis "small_signal"): same idea as the BJT ones, with RD in place of RC and RS in place
+  of RE; a gate resistor RG ["g","0"] (often a few MΩ) sets the input resistance. Keep the capacitors.
+    common source : R1 ["vdd","g"], R2 ["g","0"], RD ["vdd","d"], RS ["s","0"], M1 ["d","g","s"],
+                    V1 ["in","0"] ac, C1 ["in","g"], CS ["s","0"] (the bypass, if there is one)
+    source follower: as above without RD (drain to "vdd": M1 ["vdd","g","s"]), output at the source
+- Queries: Q-point / operating point / region -> "bias(M1)"; "ID(M1)", "VGS(M1)", "VDS(M1)" (PMOS:
+  "VSG(M1)", "VSD(M1)"), overdrive V_OV -> "VOV(M1)"; "gm(M1)", "ro(M1)"; node voltages "V(d)", "V(s)";
+  power "P(M1)"; gain / input / output resistance -> "gain", "Rin", "Rout".
+
+COMPARATORS AND SCHMITT TRIGGERS (an op-amp whose output sits at a supply rail)
+- A comparator has NO negative feedback: nothing connects the output back to "in-". A Schmitt trigger has
+  POSITIVE feedback: a resistor from "out" back to "in+". Never route the feedback resistor of a Schmitt
+  trigger to the inverting input - that would make it an ordinary amplifier.
+- Keep the rails in "assumptions" exactly as the question gives them ("supply +/-12 V", "Vcc = 15 V and
+  Vee = -15 V", "the output saturates at 13 V"); do not add sources for them. If the question gives no
+  rails at all, say so in "missing_info".
+- Templates ("p" is the non-inverting input node):
+    plain comparator      : V1 ["in","0"] (the signal), VREF ["ref","0"], op-amp ["out","in","ref"]
+                            (signal on in+, reference on in-; swap the last two nodes if the question puts
+                            the signal on the inverting input)
+    inverting Schmitt     : V1 ["in","0"], R1 ["p","0"], R2 ["out","p"], op-amp ["out","p","in"]
+                            (the signal goes to in-, the divider R1-R2 sets in+)
+    non-inverting Schmitt : V1 ["in","0"], R1 ["in","p"], R2 ["out","p"], op-amp ["out","p","0"]
+                            (the signal reaches in+ THROUGH R1, and in- is grounded or at a reference)
+    with a reference      : the same, but the far end of R1 goes to a reference node instead of ground:
+                            R1 ["p","ref"], VREF ["ref","0"]
+- Queries: upper threshold / upper trip point / UTP / V_UT -> "VTH"; lower threshold / LTP / V_LT -> "VTL";
+  hysteresis / hysteresis width / dead band -> "hysteresis"; both thresholds at once -> ["VTH","VTL"];
+  "is the output high or low" / the state of the op-amp -> "state(U1)"; the output voltage for a given input
+  -> "V(out)". Use analysis "dc" with the input as a plain DC "value".
+- "VTH" and "VTL" are written BARE, with no brackets: they are threshold voltages of the whole circuit.
+  Do not confuse them with the Thevenin voltage, which is "Vth(a,b)" WITH its two nodes.
+- A Schmitt trigger driven by a sine or triangle wave, where the question asks for the thresholds or the
+  hysteresis, is still analysis "dc": the thresholds do not depend on the waveform. Put the input source in
+  with value "0" and keep the waveform description out of the netlist.
+
+OSCILLATORS (analysis "ac", and NO source at all)
+- An oscillator has NO input: do not add a source, an AC source or a "small disturbance". The netlist is just
+  the amplifier and the feedback network. Supply rails go in "assumptions", as for any op-amp.
+- Templates (node names are examples; "n" is the op-amp's − input):
+    Wien bridge      : op-amp ["out","p","n"], R1 ["n","0"], R2 ["n","out"]   (R2 = the feedback resistor),
+                       series arm Rs ["out","x"] + Cs ["x","p"], shunt arm Rp ["p","0"] + Cp ["p","0"]
+                       (so the RC network feeds the + input, and R1/R2 set the gain at the − input)
+    RC phase shift   : op-amp ["out","0","n"] (+ input grounded), Rf ["n","out"], and THREE CR sections from
+                       the output back to the − input: C1 ["out","a"], R1 ["a","0"], C2 ["a","b"],
+                       R2 ["b","0"], C3 ["b","c"], R3 ["c","n"]
+                       (the last resistor ends at the − input, which is a virtual ground)
+                       Three sections means THREE capacitors AND THREE resistors, in C-R pairs. Do NOT stop
+                       the ladder at C3 ["b","n"], and do NOT add a resistor from the − input to ground: the
+                       − input is a virtual ground, so such a resistor has 0 V across it and does nothing.
+                       Getting this wrong changes the answer (f0 = 1/(2*pi*R*C*sqrt6) and Rf/R = 29 for three
+                       complete sections, but 1/(2*pi*R*C*sqrt3) and Rf/R = 12 if a resistor is missing).
+- If the question asks what a resistor must BE for oscillation ("find the value of Rf", "what gain is
+  needed"), leave that one component's "value" as its symbol, e.g. {"id": "Rf", "type": "R",
+  "nodes": ["n","out"], "value": "Rf"}, and ask for "gain_condition". Only ONE value may be left symbolic.
+- Queries: frequency of oscillation -> "fosc"; the condition on the gain or the feedback resistor
+  -> "gain_condition"; "state the Barkhausen criterion for this circuit" -> "barkhausen"; "will it
+  oscillate?" -> "oscillates". Use analysis "ac" and leave "frequency" null.
+
 ONLY WHAT THE QUESTION DESCRIBES
 - Include ONLY the components the question describes. NEVER add test sources, 0 V "ammeter" sources, shorts,
   loads or probes. Thevenin, Norton, impedance and resistance queries (Rth, Vth, Isc, In, Rn, Z) make the
@@ -269,6 +381,31 @@ the Zener. Find the load voltage and the Zener current.
  "query": ["V(out)", "I(D1)"], "frequency": null, "assumptions": ["Zener reverse-connected as a regulator"],
  "missing_info": []}
 
+Question: An NMOS transistor with k = 0.5 mA/V^2 and Vt = 1 V is biased from VDD = 10 V with RD = 2 kOhm,
+RS = 1 kOhm and a gate divider R1 = 1 MOhm, R2 = 1 MOhm. Find the drain current and VDS.
+{"analysis": "dc",
+ "components": [
+   {"id": "VDD", "type": "V", "nodes": ["vdd", "0"], "value": "10"},
+   {"id": "R1", "type": "R", "nodes": ["vdd", "g"], "value": "1Meg"},
+   {"id": "R2", "type": "R", "nodes": ["g", "0"], "value": "1Meg"},
+   {"id": "RD", "type": "R", "nodes": ["vdd", "d"], "value": "2k"},
+   {"id": "RS", "type": "R", "nodes": ["s", "0"], "value": "1k"},
+   {"id": "M1", "type": "M", "nodes": ["d", "g", "s"], "model": "NMOS",
+    "params": {"k": 0.5e-3, "Vt": 1}}],
+ "query": ["ID(M1)", "VDS(M1)", "bias(M1)"], "frequency": null, "assumptions": [], "missing_info": []}
+
+Question: A voltage-divider biased NPN transistor has VCC = 12 V, R1 = 47 kOhm, R2 = 10 kOhm, RC = 2.2 kOhm,
+RE = 1 kOhm and beta = 100. Find the Q-point.
+{"analysis": "dc",
+ "components": [
+   {"id": "VCC", "type": "V", "nodes": ["vcc", "0"], "value": "12"},
+   {"id": "R1", "type": "R", "nodes": ["vcc", "b"], "value": "47k"},
+   {"id": "R2", "type": "R", "nodes": ["b", "0"], "value": "10k"},
+   {"id": "RC", "type": "R", "nodes": ["vcc", "c"], "value": "2.2k"},
+   {"id": "RE", "type": "R", "nodes": ["e", "0"], "value": "1k"},
+   {"id": "Q1", "type": "Q", "nodes": ["c", "b", "e"], "model": "NPN", "params": {"beta": 100}}],
+ "query": ["bias(Q1)", "IC(Q1)", "VCE(Q1)"], "frequency": null, "assumptions": [], "missing_info": []}
+
 Question: A bridge rectifier is fed from a 12 V rms, 50 Hz secondary and drives a 1 kOhm load. Using silicon
 diodes, find the peak output voltage, the average output voltage and the PIV of each diode.
 {"analysis": "transient",
@@ -280,6 +417,51 @@ diodes, find the peak output voltage, the average output voltage and the PIV of 
    {"id": "D4", "type": "D", "nodes": ["0", "b"]},
    {"id": "RL", "type": "R", "nodes": ["out", "0"], "value": "1k"}],
  "query": ["Vmax(out)", "Vavg(out)", "PIV(D1)"], "frequency": "50", "assumptions": [], "missing_info": []}
+
+Question: An inverting Schmitt trigger uses an op-amp with +/-12 V supplies, R1 = 10 kOhm from the
+non-inverting input to ground and R2 = 100 kOhm from the output back to the non-inverting input. The input
+signal goes to the inverting input. Find the upper and lower trip points and the hysteresis.
+(The feedback goes to in+, so this is positive feedback; the input source is a DC placeholder at 0 V.)
+{"analysis": "dc",
+ "components": [
+   {"id": "V1", "type": "V", "nodes": ["in", "0"], "value": "0"},
+   {"id": "R1", "type": "R", "nodes": ["p", "0"], "value": "10k"},
+   {"id": "R2", "type": "R", "nodes": ["out", "p"], "value": "100k"},
+   {"id": "U1", "type": "OPAMP", "nodes": ["out", "p", "in"], "model": "ideal"}],
+ "query": ["VTH", "VTL", "hysteresis"], "frequency": null,
+ "assumptions": ["supply +/-12 V"], "missing_info": []}
+
+Question: A Wien-bridge oscillator uses R = 10 kOhm and C = 10 nF in both arms of the bridge, with
+R1 = 10 kOhm from the inverting input to ground and R2 = 20 kOhm of feedback. Find the frequency of
+oscillation.
+(No source: an oscillator has none. The RC network feeds the + input; R1 and R2 set the gain.)
+{"analysis": "ac",
+ "components": [
+   {"id": "R1", "type": "R", "nodes": ["n", "0"], "value": "10k"},
+   {"id": "R2", "type": "R", "nodes": ["n", "out"], "value": "20k"},
+   {"id": "Rs", "type": "R", "nodes": ["out", "x"], "value": "10k"},
+   {"id": "Cs", "type": "C", "nodes": ["x", "p"], "value": "10n"},
+   {"id": "Rp", "type": "R", "nodes": ["p", "0"], "value": "10k"},
+   {"id": "Cp", "type": "C", "nodes": ["p", "0"], "value": "10n"},
+   {"id": "U1", "type": "OPAMP", "nodes": ["out", "p", "n"], "model": "ideal"}],
+ "query": ["fosc"], "frequency": null, "assumptions": [], "missing_info": []}
+
+Question: An RC phase-shift oscillator uses three identical RC sections with R = 10 kOhm and C = 10 nF around
+an inverting op-amp. Find the frequency of oscillation and the feedback resistor needed to sustain it.
+(Three COMPLETE sections: three capacitors and three resistors. The third resistor R3 ends at the − input,
+which is the virtual ground; no resistor is added from the − input to ground. Rf is what the question asks
+for, so its value stays the symbol "Rf".)
+{"analysis": "ac",
+ "components": [
+   {"id": "C1", "type": "C", "nodes": ["out", "a"], "value": "10n"},
+   {"id": "R1", "type": "R", "nodes": ["a", "0"], "value": "10k"},
+   {"id": "C2", "type": "C", "nodes": ["a", "b"], "value": "10n"},
+   {"id": "R2", "type": "R", "nodes": ["b", "0"], "value": "10k"},
+   {"id": "C3", "type": "C", "nodes": ["b", "c"], "value": "10n"},
+   {"id": "R3", "type": "R", "nodes": ["c", "n"], "value": "10k"},
+   {"id": "Rf", "type": "R", "nodes": ["n", "out"], "value": "Rf"},
+   {"id": "U1", "type": "OPAMP", "nodes": ["out", "0", "n"], "model": "ideal"}],
+ "query": ["fosc", "gain_condition"], "frequency": null, "assumptions": [], "missing_info": []}
 """
 
 TEXT_PARSER_USER = "Question:\n{question}\n\nReturn the JSON object only."

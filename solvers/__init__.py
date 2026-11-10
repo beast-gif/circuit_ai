@@ -1,15 +1,21 @@
 """
 Solver registry. The first solver whose supports() accepts the netlist is used.
-Later phases add OpAmpSolver, TransistorSolver, OscillatorSolver to SOLVERS.
+Later phases add more solvers to SOLVERS.
 """
 from typing import Dict, List
 
 from schemas import Netlist, SolveResult
 from solvers.base import BaseSolver, NotSupportedError, SolverError
+from solvers.bjt import TransistorSolver
+from solvers.comparator import ComparatorSolver
 from solvers.dc_ac import DCACSolver
 from solvers.diode import DiodeSolver
+from solvers.oscillator import OscillatorSolver
 
-SOLVERS: List[BaseSolver] = [DiodeSolver(), DCACSolver()]
+# the oscillator solver comes before the comparator one: both see an op-amp without negative
+# feedback, and only the oscillator's source-free test tells them apart
+SOLVERS: List[BaseSolver] = [TransistorSolver(), DiodeSolver(), OscillatorSolver(),
+                            ComparatorSolver(), DCACSolver()]
 
 
 def get_solver(nl: Netlist) -> BaseSolver:

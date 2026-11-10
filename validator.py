@@ -37,13 +37,18 @@ _Q_COMP = re.compile(r"^(I|P)\((\w+)\)$")                     # I(R1), P(R1)
 _Q_PORT = re.compile(r"^(Z|Rth|Vth|Zth|Isc|Rn|In)\((\w+),(\w+)\)$")  # Rth(a,b)
 _Q_TRANSFER = re.compile(r"^H\((\w+),(\w+)\)$")               # H(out,in) or H(out,V1)
 _Q_BIAS = re.compile(r"^bias\((\w+)\)$")                      # bias(Q1)
-_Q_BARE = re.compile(r"^(Rin|Rout|gain|fc|f0|poles|zeros|tau|Qfactor|bandwidth|filter)$")
+_Q_DEV = re.compile(r"^(IC|IB|IE|VCE|VBE|VEC|VEB|region|gm|rpi|ro|re)\((\w+)\)$")   # IC(Q1), gm(Q1): BJT
+_Q_FET = re.compile(r"^(ID|IS|IG|VGS|VDS|VSG|VSD|VOV)\((\w+)\)$")                  # ID(M1), VDS(M1): MOSFET
+_Q_STATE = re.compile(r"^state\((\w+)\)$")                                        # state(U1): comparator
+_Q_BARE = re.compile(r"^(Rin|Rout|gain|fc|f0|poles|zeros|tau|Qfactor|bandwidth|filter|VTH|VTL|hysteresis|"
+                     r"trip|fosc|barkhausen|gain_condition|oscillates)$")
 _Q_WAVE_V = re.compile(r"^(Vmax|Vmin|Vavg|Vrms|vtc|Vripple|Vpp|ripple)\((\w+)(?:,(\w+))?\)$")   # waveform of a node: Vavg(out)
 _Q_WAVE_C = re.compile(r"^(Imax|Iavg|Irms|PIV|conduction)\((\w+)\)$")       # of a component: PIV(D1)
 
 QUERY_HELP = ("V(node), V(a,b), I(comp), P(comp), Rth(a,b), Vth(a,b), Z(a,b), "
               "H(out,in), bias(Q1), Rin, Rout, gain, fc, f0, poles, zeros, tau, Qfactor, bandwidth, filter, "
-              "Vmax(n), Vmin(n), Vavg(n), Vrms(n), vtc(n), Vripple(n), ripple(n), Imax(X), Iavg(X), Irms(X), PIV(D1), conduction(D1)")
+              "IC(Q1), IB(Q1), IE(Q1), VCE(Q1), VBE(Q1), gm(Q1), rpi(Q1), re(Q1), ID(M1), VGS(M1), VDS(M1), VOV(M1), "
+              "VTH, VTL, hysteresis, state(U1), fosc, barkhausen, gain_condition, oscillates, Vmax(n), Vmin(n), Vavg(n), Vrms(n), vtc(n), Vripple(n), ripple(n), Imax(X), Iavg(X), Irms(X), PIV(D1), conduction(D1)")
 
 VOLTAGE_TYPES = {"V", "E", "H"}            # elements that force a voltage
 CURRENT_TYPES = {"I", "G", "F"}            # elements that force a current
@@ -244,6 +249,21 @@ def _check_queries(nl: Netlist, nodes: List[str], types: Dict[str, str],
                 rep.errors.append(f"Query {q}: input '{inp}' is neither a node nor a source id.")
             if inp in node_set:
                 mentioned.add(inp)
+        elif m := _Q_STATE.match(q):
+            need_comp(m.group(1), q)
+        elif m := _Q_FET.match(q):
+            cid = m.group(2)
+            need_comp(cid, q)
+            if cid in types and types[cid] != "M":
+                rep.errors.append(f"Query {q}: {m.group(1)}() needs a MOSFET, {cid} is {types[cid]}.")
+        elif m := _Q_DEV.match(q):
+            cid = m.group(2)
+            need_comp(cid, q)
+            if cid in types and types[cid] not in ("Q", "M"):
+                rep.errors.append(f"Query {q}: {m.group(1)}() needs a transistor, {cid} is {types[cid]}.")
+            elif cid in types and types[cid] == "M" and m.group(1) not in ("gm", "ro", "region"):
+                rep.errors.append(f"Query {q}: {m.group(1)}() is a BJT quantity; for a MOSFET ask for "
+                                  f"ID({cid}), VGS({cid}), VDS({cid}) or gm({cid}).")
         elif m := _Q_BIAS.match(q):
             cid = m.group(1)
             need_comp(cid, q)

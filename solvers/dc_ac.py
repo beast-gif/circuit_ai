@@ -65,8 +65,8 @@ class DCACSolver(BaseSolver):
 
     def supports(self, nl: Netlist) -> Tuple[bool, str]:
         types = {c.type.value for c in nl.components}
-        if "D" in types and not types & {"Q", "M"}:
-            return False, ""                      # the diode solver handles (or explains) diode circuits
+        if types & {"D", "Q", "M"}:
+            return False, ""                      # the diode / transistor solvers handle (or explain) these
         later = sorted(types - LINEAR_TYPES)
         if later:
             return False, "Needs " + ", ".join(LATER_PHASE.get(t, t) for t in later)

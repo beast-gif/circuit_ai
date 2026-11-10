@@ -416,17 +416,22 @@ class MNA:
         return known
 
     # ------------------------------------------------------------------
-    def solve(self) -> Dict[sp.Symbol, sp.Expr]:
+    def system(self) -> Tuple[sp.Matrix, sp.Matrix]:
+        """Assemble A·x = b without solving it. The oscillator solver needs A on its own: a circuit with no
+        source has b = 0, and then a non-zero solution exists only where det(A) = 0 (the characteristic
+        equation), which is where the poles of the circuit are."""
         empty = [n for n in self.nodes if not self.kcl[n]]
         if empty:
             why = "in DC (capacitors are open circuits)" if self.mode == "dc" else "here"
             raise SolverError(f"Node(s) {empty} have nothing that carries current {why}, "
                               "so their voltage is undefined.")
-
         self.unknowns = [self.V[n] for n in self.nodes] + list(self.branch.values())
         eqs = [sp.Add(*[t.expr for t in self.kcl[n]]) for n in self.nodes] + [e for e, _, _ in self.constraints]
         self.A, self.b = sp.linear_eq_to_matrix(eqs, self.unknowns)
+        return self.A, self.b
 
+    def solve(self) -> Dict[sp.Symbol, sp.Expr]:
+        self.system()
         sol = sp.linsolve((self.A, self.b), self.unknowns)
         if sol == sp.S.EmptySet or len(sol) == 0:
             raise SolverError("The circuit equations contradict each other (e.g. a voltage source shorted "

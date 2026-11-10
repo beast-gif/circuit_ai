@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 from llm_client import LLMError, VelonaClient, extract_json
 from parsing.prompts import NOT_JSON_FEEDBACK, RETRY_FEEDBACK, TEXT_PARSER_SYSTEM, TEXT_PARSER_USER
-from schemas import Netlist, parse_value
+from schemas import Netlist, is_symbolic, parse_value
 from validator import ValidationReport, validate
 
 # LLM spelling -> (type, default model)
@@ -39,7 +39,8 @@ TYPE_ALIASES: Dict[str, tuple] = {
     "dc_current_source": ("I", None), "ac_current_source": ("I", None),
     "diode": ("D", None), "zener": ("D", "zener"), "zener_diode": ("D", "zener"), "led": ("D", "led"),
     "bjt": ("Q", None), "transistor": ("Q", None), "npn": ("Q", "NPN"), "pnp": ("Q", "PNP"),
-    "mosfet": ("M", None), "nmos": ("M", "NMOS"), "pmos": ("M", "PMOS"),
+    "mosfet": ("M", None), "nmos": ("M", "NMOS"), "pmos": ("M", "PMOS"), "fet": ("M", None),
+    "nfet": ("M", "NMOS"), "pfet": ("M", "PMOS"), "mos": ("M", None),
     "opamp": ("OPAMP", "ideal"), "op_amp": ("OPAMP", "ideal"),
     "operational_amplifier": ("OPAMP", "ideal"),
     "vcvs": ("E", None), "vccs": ("G", None), "cccs": ("F", None), "ccvs": ("H", None),
@@ -59,10 +60,29 @@ QUERY_NAMES = {"v": "V", "i": "I", "p": "P", "z": "Z", "h": "H", "rth": "Rth", "
                "vrms": "Vrms", "vtc": "vtc", "imax": "Imax", "ipeak": "Imax", "iavg": "Iavg", "idc": "Iavg",
                "irms": "Irms", "piv": "PIV", "prv": "PIV", "conduction": "conduction",
                "conduction_angle": "conduction", "vripple": "Vripple", "vr": "Vripple", "vpp": "Vpp",
-               "ripple": "ripple", "ripple_factor": "ripple", "rf": "ripple"}
-BARE_NAMES = {"rin": "Rin", "rout": "Rout", "gain": "gain", "fc": "fc", "f0": "f0", "poles": "poles",
+               "ripple": "ripple", "ripple_factor": "ripple", "rf": "ripple",
+               "ic": "IC", "ib": "IB", "ie": "IE", "vce": "VCE", "vbe": "VBE", "vec": "VEC", "veb": "VEB",
+               "region": "region", "q_point": "bias", "qpoint": "bias", "operating_point": "bias",
+               "state": "state",
+               # NOTE: "vth" with node arguments stays Thevenin -- Vth(a,b) -- which is what Phase 1 means by
+               # it. The Schmitt-trigger thresholds VTH / VTL are BARE queries, in BARE_NAMES below.
+               "gm": "gm", "rpi": "rpi", "r_pi": "rpi", "rpie": "rpi", "ro": "ro", "r_o": "ro", "re": "re",
+               "r_e": "re", "id": "ID", "idss": "ID", "is": "IS", "ig": "IG", "vgs": "VGS", "vds": "VDS",
+               "vsg": "VSG", "vsd": "VSD", "vov": "VOV", "vdsat": "VOV", "vgsq": "VGS"}
+BARE_NAMES = {"rin": "Rin", "rout": "Rout", "gain": "gain", "av": "gain", "a_v": "gain",
+              "voltage_gain": "gain", "fc": "fc", "f0": "f0", "poles": "poles",
               "zeros": "zeros", "tau": "tau", "qfactor": "Qfactor", "bandwidth": "bandwidth",
-              "filter": "filter", "filter_type": "filter", "type": "filter", "response": "filter"}
+              "filter": "filter", "filter_type": "filter", "type": "filter", "response": "filter",
+              "vth": "VTH", "vut": "VTH", "vh": "VTH", "upper_threshold": "VTH", "utp": "VTH",
+              "vtl": "VTL", "vlt": "VTL", "vl": "VTL", "lower_threshold": "VTL", "ltp": "VTL",
+              "hysteresis": "hysteresis", "hysteresis_width": "hysteresis", "vhys": "hysteresis",
+              "trip": "trip", "trip_point": "trip", "threshold": "VTH",
+              "fosc": "fosc", "f_osc": "fosc", "oscillation_frequency": "fosc",
+              "frequency_of_oscillation": "fosc", "f_oscillation": "fosc",
+              "barkhausen": "barkhausen", "barkhausen_criterion": "barkhausen",
+              "gain_condition": "gain_condition", "condition": "gain_condition",
+              "gain_required": "gain_condition", "rf": "gain_condition",
+              "oscillates": "oscillates", "will_oscillate": "oscillates"}
 
 
 @dataclass
@@ -90,11 +110,18 @@ def _to_str(v: Any) -> Optional[str]:
     return s or None
 
 
+_BARE_ONLY = {"vtl", "vlt", "vl", "lower_threshold", "ltp", "vut", "utp", "upper_threshold",
+              "hysteresis", "hysteresis_width", "vhys", "trip", "trip_point", "threshold"}
+
+
 def _norm_query(q: Any) -> str:
     s = str(q).replace(" ", "")
     m = re.match(r"^(\w+)\((.*)\)$", s)
     if m:
-        name = QUERY_NAMES.get(m.group(1).lower(), m.group(1))
+        low = m.group(1).lower()
+        if low in _BARE_ONLY:                      # "VTL(U1)" / "hysteresis(U1)": these take no arguments
+            return BARE_NAMES[low]
+        name = QUERY_NAMES.get(low, m.group(1))
         return f"{name}({m.group(2)})"
     return BARE_NAMES.get(s.lower(), s)
 
@@ -210,7 +237,8 @@ def infer_analysis(data: Dict[str, Any]) -> Optional[str]:
         return "transient"
     if "D" in types and any(c.get("ac") not in (None, "") for c in comps):
         return "transient"                      # a diode with a sinusoidal input: rectifier / clipper
-    if types & {"Q", "M"} and kinds & {"Rin", "Rout", "gain"}:
+    if types & {"Q", "M"} and (kinds & {"Rin", "Rout", "gain", "H", "gm", "rpi", "re", "ro"}
+                               or (("C" in types) and any(c.get("ac") not in (None, "") for c in comps))):
         return "small_signal"
     if kinds & _AC_KINDS or data.get("frequency") or any(c.get("ac") not in (None, "") for c in comps):
         return "ac"
@@ -324,9 +352,14 @@ def consistency_errors(question: str, nl: Netlist) -> List[str]:
     errors += _dangling_errors(question, nl)
     errors += _added_element_errors(question, nl)
     errors += _opamp_errors(question, nl)
+    errors += _comparator_errors(question, nl)
+    errors += _oscillator_errors(question, nl)
     errors += _filter_errors(question, nl)
     errors += _loop_errors(question, nl)
     errors += _diode_errors(question, nl)
+    errors += _bjt_errors(question, nl)
+    errors += _mos_errors(question, nl)
+    errors += _value_errors(nl)
     return errors
 
 
@@ -377,16 +410,17 @@ def _opamp_errors(question: str, nl: Netlist) -> List[str]:
     if not ops:
         return []
     errors: List[str] = []
+    switching = _is_switching(question, nl)
 
     for u in ops:
         out, inp, inm = u.nodes
-        if not _has_feedback(nl, out, inm):
+        if not switching and not _has_feedback(nl, out, inm):
             errors.append(f"{u.id} has no feedback path from its output '{out}' to its − input '{inm}'. A linear "
                           f"op-amp circuit needs negative feedback (e.g. Rf between out and in−). Remember the node "
                           f"order is ['out', 'in+', 'in−'].")
 
     grounded = [u for u in ops if _to_ground_only(nl, u.nodes[1], u.id)]
-    if _INVERTING.search(question) and not grounded:
+    if _INVERTING.search(question) and not switching and not grounded:
         u = ops[0]
         errors.append(f"The question describes an inverting amplifier: the op-amp's + input goes to ground and the "
                       f"signal reaches the − input through the input resistor. Here {u.id}'s + input is "
@@ -410,6 +444,114 @@ def _opamp_errors(question: str, nl: Netlist) -> List[str]:
             u.nodes[2] in c.nodes and u.nodes[0] not in c.nodes for u in ops for c in caps):
         errors.append("An op-amp differentiator has the capacitor at the input (from the input to the − input) "
                       "and the resistor in the feedback path (between the output and the − input).")
+    return errors
+
+
+# ----------------------------------------------------------------------
+# Comparator / Schmitt-trigger checks (Phase 3, step 6)
+# ----------------------------------------------------------------------
+_SCHMITT = re.compile(r"\bschmitt\b|\bhyster|\bsnap[- ]?action\b|\bregenerative\s+comparator\b", re.IGNORECASE)
+_COMPARATOR = re.compile(r"\bcomparator\b|\bzero[- ]crossing\s+detector\b|\blevel\s+detector\b|"
+                         r"\bwindow\s+detector\b", re.IGNORECASE)
+_THRESHOLD_Q = {"VTH", "VTL", "hysteresis", "trip"}
+
+
+def _is_switching(question: str, nl: Netlist) -> bool:
+    """True when the question is about a comparator / Schmitt trigger, which has no negative feedback."""
+    if any(q in _THRESHOLD_Q or q.startswith("state(") for q in nl.query):
+        return True
+    return bool(_SCHMITT.search(question) or _COMPARATOR.search(question))
+
+
+def _comparator_errors(question: str, nl: Netlist) -> List[str]:
+    ops = [c for c in nl.components if c.type.value == "OPAMP"]
+    if not ops or not _is_switching(question, nl):
+        return []
+    errors: List[str] = []
+    schmitt = bool(_SCHMITT.search(question)) or any(q in ("VTH", "VTL", "hysteresis", "trip") for q in nl.query)
+
+    for u in ops:
+        out, inp, inm = u.nodes
+        fb_plus = _has_feedback(nl, out, inp)
+        fb_minus = _has_feedback(nl, out, inm)
+        if schmitt and not fb_plus:
+            if fb_minus:
+                errors.append(f"{u.id}'s feedback resistor goes to its − input '{inm}', which is NEGATIVE feedback "
+                              f"(an ordinary amplifier). A Schmitt trigger needs POSITIVE feedback: put the "
+                              f"feedback resistor between the output '{out}' and the + input, and remember the "
+                              f"node order is ['out', 'in+', 'in−'].")
+            else:
+                errors.append(f"The question describes a Schmitt trigger (hysteresis), but {u.id} has no feedback "
+                              f"path from its output '{out}' back to its + input '{inp}'. Add the positive-feedback "
+                              f"resistor between the output and the + input.")
+        elif schmitt and fb_minus:
+            errors.append(f"{u.id} has feedback to BOTH inputs. A Schmitt trigger has positive feedback only: "
+                          f"remove the path from '{out}' to the − input '{inm}'.")
+
+    if _SCHMITT.search(question) and nl.analysis.value not in ("dc",):
+        errors.append('Threshold / hysteresis questions use analysis "dc": the trip points do not depend on the '
+                      'input waveform. Put the input source in with value "0".')
+
+    if any(q in _THRESHOLD_Q for q in nl.query) and not any(
+            c.type.value in ("V", "I") and c.id.upper() not in ("VREF", "VCC", "VEE", "VDD", "VSS")
+            for c in nl.components):
+        errors.append("A threshold question needs the input source in the netlist (the trip point is the value of "
+                      'that source), e.g. {"id": "V1", "type": "V", "nodes": ["in", "0"], "value": "0"}.')
+    return errors
+
+
+# ----------------------------------------------------------------------
+# Oscillator checks (Phase 4, step 1)
+# ----------------------------------------------------------------------
+_OSC_Q = {"fosc", "barkhausen", "gain_condition", "oscillates"}
+_PHASE_SHIFT = re.compile(r"\bphase[- ]shift\s+oscillator\b|\bRC\s+phase[- ]shift\b", re.IGNORECASE)
+
+
+def _oscillator_errors(question: str, nl: Netlist) -> List[str]:
+    ops = [c for c in nl.components if c.type.value == "OPAMP"]
+    srcs = [c for c in nl.components if c.type.value in ("V", "I")]
+    if not ops or not (set(nl.query) & _OSC_Q):
+        return []
+    errors: List[str] = []
+    if srcs:
+        errors.append("An oscillator has no input: remove "
+                      + ", ".join(c.id for c in srcs)
+                      + ". The oscillation comes from the feedback loop itself, and the solver finds it from "
+                        "det A(s) = 0, which needs the circuit to be source-free.")
+
+    op = ops[0]
+    out, inp, inm = op.nodes
+    rs = [c for c in nl.components if c.type.value == "R"]
+    cs = [c for c in nl.components if c.type.value == "C"]
+    feedback = [c for c in rs if set(c.nodes[:2]) == {out, inm}]
+    if not feedback:
+        errors.append(f"{op.id} has no feedback resistor between its output '{out}' and its − input '{inm}'. "
+                      "Every op-amp oscillator needs one: it sets the gain that makes up for the loss in the "
+                      "RC network.")
+
+    # a resistor from the − input to ground does nothing when the + input is grounded: the − input is a
+    # virtual ground, so both of its ends are at 0 V
+    if inp == "0":
+        dead = [c for c in rs if set(c.nodes[:2]) == {inm, "0"}]
+        if dead:
+            errors.append(f"{dead[0].id} connects the − input '{inm}' to ground, but with the + input grounded "
+                          f"the − input is a VIRTUAL ground: both of its ends sit at 0 V, so it carries no "
+                          f"signal and does nothing. In an RC phase-shift oscillator the last section's "
+                          f"resistor goes from the previous node TO the − input, not from the − input to "
+                          f"ground.")
+
+    # every section of a phase-shift ladder is one C and one R: they must come in pairs
+    if _PHASE_SHIFT.search(question) or len(cs) >= 3:
+        ladder_r = [c for c in rs if c not in feedback and not (inp == "0" and set(c.nodes[:2]) == {inm, "0"})]
+        if len(cs) >= 3 and len(ladder_r) < len(cs):
+            errors.append(f"The ladder has {len(cs)} capacitors but only {len(ladder_r)} resistors beside the "
+                          f"feedback resistor. Each RC section is one capacitor AND one resistor, so write "
+                          f"three complete sections: C1 ['out','a'], R1 ['a','0'], C2 ['a','b'], "
+                          f"R2 ['b','0'], C3 ['b','c'], R3 ['c','{inm}'] -- the last resistor ends at the "
+                          f"− input.")
+        elif len(cs) >= 3 and not any(inm in c.nodes[:2] for c in ladder_r):
+            errors.append(f"The last section of the ladder must reach the − input '{inm}' through its "
+                          f"RESISTOR (R3 ['c','{inm}']), with its capacitor before it (C3 ['b','c']).")
     return errors
 
 
@@ -652,6 +794,114 @@ def _rectifier_errors(question: str, nl: Netlist, ds) -> List[str]:
     return errors
 
 
+# ----------------------------------------------------------------------
+# MOSFET checks (Phase 3, step 5)
+# ----------------------------------------------------------------------
+_PMOS = re.compile(r"\bp-?\s?mos\b|\bp-?channel\b|\bpmosfet\b", re.IGNORECASE)
+_NMOS = re.compile(r"\bn-?\s?mos\b|\bn-?channel\b|\bnmosfet\b", re.IGNORECASE)
+_VT_IN_TEXT = re.compile(r"(?:V_?t(?:h|n|p|0)?|threshold(?:\s+voltage)?)\s*(?:=|is|of)?\s*"
+                         r"[-+]?(\d+(?:\.\d+)?)\s*V", re.IGNORECASE)
+_K_PARAMS = ("k", "kn", "kp", "beta", "k2", "kprime", "k_prime", "mucox", "mu_cox", "kn_prime", "kp_prime")
+_VT_PARAMS = ("vt", "vth", "vto", "vtn", "vtp", "v_t", "v_th", "threshold")
+
+
+def _mos_errors(question: str, nl: Netlist) -> List[str]:
+    ms = [c for c in nl.components if c.type.value == "M"]
+    if not ms:
+        return []
+    errors: List[str] = []
+    models = {(c.model or "").strip().upper() for c in ms}
+    if _PMOS.search(question) and not _NMOS.search(question) and "PMOS" not in models:
+        errors.append('The question has a PMOS (p-channel) transistor: set "model": "PMOS" (its source goes '
+                      'toward the positive supply; nodes are still ["drain", "gate", "source"]).')
+    if _NMOS.search(question) and not _PMOS.search(question) and models - {"NMOS", ""}:
+        errors.append('The question has an NMOS (n-channel) transistor: set "model": "NMOS".')
+    for c in ms:
+        p = {str(k).strip().lower().replace(" ", "_").replace("-", "_") for k, v in (c.params or {}).items()
+             if v not in (None, "")}
+        if not p & set(_K_PARAMS):
+            errors.append(f'{c.id} has no conduction parameter: add params {{"k": ...}} in A/V² (I_D = '
+                          f'½·k·V_OV²), or "kprime" with "WL", or "K2" when the question writes '
+                          f'I_D = K·(V_GS − V_t)² without the ½.')
+        if not p & set(_VT_PARAMS):
+            errors.append(f'{c.id} has no threshold voltage: add params {{"Vt": ...}} (a magnitude; the sign '
+                          f'comes from the NMOS / PMOS model).')
+    vts = {float(m.group(1)) for m in _VT_IN_TEXT.finditer(question)}
+    if len(vts) == 1:
+        want = vts.pop()
+        for c in ms:
+            p = {str(k).strip().lower().replace(" ", "_"): v for k, v in (c.params or {}).items()}
+            got = next((p[k] for k in _VT_PARAMS if k in p), None)
+            if got is not None and not _num_eq(str(got), want) and not _num_eq(str(got), -want):
+                errors.append(f"The question gives V_t = {want:g} V: set params {{\"Vt\": {want:g}}} on {c.id}.")
+    return errors
+
+
+def _value_errors(nl: Netlist) -> List[str]:
+    """A component whose value is a NAME in an otherwise numeric circuit: usually an invented placeholder
+    ("bypass", "large", "C") where the question gave no number. A fully symbolic circuit is fine."""
+    vals = [(c, c.value) for c in nl.components if c.type.value in ("R", "C", "L") and c.value not in (None, "")]
+    numeric = [c for c, v in vals if not is_symbolic(v)]
+    named = [(c, v) for c, v in vals if is_symbolic(v)]
+    if not numeric or not named:
+        return []
+    # A design question leaves exactly one value as a symbol ON PURPOSE: "what must Rf be for it to
+    # oscillate" is answered by solving for that symbol, so it is not an invented placeholder.
+    if len(named) == 1 and any(q in ("gain_condition", "fosc", "barkhausen", "oscillates") for q in nl.query):
+        return []
+    out = []
+    for c, v in named:
+        unit = {"R": '"1k"', "C": '"10u"', "L": '"1m"'}[c.type.value]
+        out.append(f'{c.id} has "{v}" as its value, which is not a number, while the rest of the circuit has '
+                   f'numbers. Put a number there (e.g. {unit}); if the question gives none, choose a typical '
+                   f'value and say so in "assumptions".')
+    return out
+
+
+# ----------------------------------------------------------------------
+# BJT checks (Phase 3)
+# ----------------------------------------------------------------------
+_BETA_IN_TEXT = re.compile(r"(?:β|\bbeta\b|\bh_?fe\b|\bhFE\b|\bβdc\b|\bbeta_?dc\b)\s*(?:=|of|is|:)?\s*(\d+(?:\.\d+)?)",
+                           re.IGNORECASE)
+_EMITTER_GROUNDED = re.compile(r"emitter\s+(?:is\s+|terminal\s+is\s+)?(?:grounded|connected\s+(?:directly\s+)?to\s+ground|"
+                               r"at\s+ground|tied\s+to\s+ground)", re.IGNORECASE)
+
+
+def _bjt_errors(question: str, nl: Netlist) -> List[str]:
+    qs = [c for c in nl.components if c.type.value == "Q"]
+    if not qs:
+        return []
+    errors: List[str] = []
+    models = {(c.model or "").strip().upper() for c in qs}
+    if re.search(r"\bpnp\b", question, re.IGNORECASE) and not re.search(r"\bnpn\b", question, re.IGNORECASE) \
+            and "PNP" not in models:
+        errors.append('The question has a PNP transistor: set "model": "PNP" (its emitter goes toward the positive '
+                      'supply; nodes are still ["collector", "base", "emitter"]).')
+    if re.search(r"\bnpn\b", question, re.IGNORECASE) and not re.search(r"\bpnp\b", question, re.IGNORECASE) \
+            and models - {"NPN", ""}:
+        errors.append('The question has an NPN transistor: set "model": "NPN".')
+    betas = {float(m.group(1)) for m in _BETA_IN_TEXT.finditer(question)}
+    if len(betas) == 1 and len(qs) >= 1:
+        want = betas.pop()
+        for c in qs:
+            p = {str(k).lower(): v for k, v in (c.params or {}).items()}
+            got = next((p[k] for k in ("beta", "β", "hfe", "bf") if k in p), None)
+            if got is None or not _num_eq(str(got), want):
+                errors.append(f"The question gives β = {want:g}: set params {{\"beta\": {want:g}}} on {c.id}.")
+    if nl.analysis.value == "small_signal":
+        if not any(c.type.value == "C" for c in nl.components) and re.search(
+                r"\bcoupl|\bbypass|\bcapacitor", question, re.IGNORECASE):
+            errors.append("The question has coupling / bypass capacitors: keep them in the netlist (the solver "
+                          "opens them for the DC bias and shorts them for the signal).")
+        if not any(c.type.value in ("V", "I") and c.ac not in (None, "") for c in nl.components):
+            errors.append('A small-signal amplifier needs a signal source with an AC magnitude: add '
+                          '{"id": "V1", "type": "V", "nodes": ["in", "0"], "ac": "1"} where the signal enters.')
+    if _EMITTER_GROUNDED.search(question) and len(qs) == 1 and qs[0].nodes[2] != "0":
+        errors.append(f"The question says the emitter is grounded: {qs[0].id} nodes are [collector, base, emitter], "
+                      f"so the third node must be \"0\" (it is \"{qs[0].nodes[2]}\").")
+    return errors
+
+
 def _num_eq(raw: Optional[str], x: float) -> bool:
     try:
         return abs(parse_value(raw) - x) <= 1e-9 * max(abs(x), 1e-30)
@@ -677,7 +927,9 @@ def _added_element_errors(question: str, nl: Netlist) -> List[str]:
     q = question.lower()
 
     # a 0 V voltage source is a short / ammeter the question never describes
-    if not re.search(r"\b0\s*v\b|\bzero[- ]volt|\bshort", q):
+    # (a threshold question is the exception: its input source is a placeholder the solver replaces by a symbol)
+    threshold = any(x in _THRESHOLD_Q for x in nl.query)
+    if not threshold and not re.search(r"\b0\s*v\b|\bzero[- ]volt|\bshort", q):
         for c in nl.components:
             # (a sinusoid given only as params {"Vrms": ..} / {"Vpp": ..} has no value and no ac: not a short)
             wave = {str(k).strip().lower() for k in (c.params or {})} & {

@@ -8,6 +8,8 @@ hand-worked answers.
     python benchmark/run_benchmark.py --ids dc,flt    # only ids starting with dc or flt
     python benchmark/run_benchmark.py --explain       # also generate explanations (costs more)
     python benchmark/run_benchmark.py --file benchmark/opamp.jsonl   # Phase 2: op-amps + active filters
+    python benchmark/run_benchmark.py --file benchmark/phase3.jsonl  # Phase 3: diodes, rectifiers, BJT, MOSFET, comparators
+    python benchmark/run_benchmark.py --file benchmark/phase3.jsonl --ids bjt,amp   # one topic group
 
 Matching is by KIND, not by exact query name, because the parser may call a node "out" or "n2":
 an expectation {"kind": "V", "value": 8} passes if ANY V(...) answer is within --tol (default 1 %)
@@ -40,9 +42,21 @@ PREFIXES = {
     # waveforms: a plain V(out) answer of a rectifier carries .max/.min/.avg/.rms too
     "Vmax": ("Vmax(", "V("), "Vmin": ("Vmin(", "V("), "Vavg": ("Vavg(", "V("), "Vrms": ("Vrms(", "V("),
     "Vripple": ("Vripple(", "Vpp("), "ripple": ("ripple(",),
-    "Vout": ("V(", "Vmax(", "Vmin(", "Vavg(", "Vrms("),     # "the output voltage" of a ripple-free output "bandwidth": ("bandwidth", "fc"), "tau": ("tau",),
-    "gain": ("gain", "H("),
+    "Vout": ("V(", "Vmax(", "Vmin(", "Vavg(", "Vrms("),     # "the output voltage" of a ripple-free output
+    # BJT Q-point: from IC(Q1) / VCE(Q1) or from bias(Q1).IC / bias(Q1).VCE
+    "IC": ("IC(", "bias("), "IB": ("IB(", "bias("), "IE": ("IE(", "bias("), "VCE": ("VCE(", "VEC(", "bias("),
+    "VEC": ("VEC(", "VCE(", "bias("), "bandwidth": ("bandwidth", "fc"), "tau": ("tau",),
+    "gain": ("gain", "H("), "Rout": ("Rout", "Zth(", "Rth("),
+    "gm": ("gm(",), "rpi": ("rpi(",), "re": ("re(",), "ro": ("ro(",),
 }
+
+# device quantities: "ID" must match ID(M1) or bias(M1).ID, never bias(M1).VDS (a plain prefix on "bias("
+# would make every sub-answer of the Q-point a candidate for every kind)
+DEVICE_KINDS = ("IC", "IB", "IE", "VCE", "VEC", "VBE", "VEB", "ID", "IS", "VGS", "VDS", "VSG", "VSD", "VOV",
+                "gm", "rpi", "re", "ro", "region")
+# a PNP reports VEC where an NPN reports VCE (and a PMOS VSG/VSD): either answers the other's expectation
+DEVICE_ALIAS = {"VCE": ("VCE", "VEC"), "VEC": ("VEC", "VCE"), "VBE": ("VBE", "VEB"), "VEB": ("VEB", "VBE"),
+                "VGS": ("VGS", "VSG"), "VSG": ("VSG", "VGS"), "VDS": ("VDS", "VSD"), "VSD": ("VSD", "VDS")}
 
 
 def load(path: Path) -> List[Dict[str, Any]]:
@@ -65,10 +79,15 @@ def candidates(numeric: Dict[str, Optional[float]], kind: str) -> List[Tuple[str
             ok = k.endswith(".dc_gain")
         elif kind == "K":                       # pass-band gain: from "filter", "gain" or "H(...)"
             ok = k == "filter.K" or k.endswith(".K")
+        elif kind in DEVICE_KINDS:
+            names = DEVICE_ALIAS.get(kind, (kind,))
+            ok = any(k.startswith(n + "(") or k.endswith("." + n) for n in names)
         elif kind == "pole":
             ok = re.fullmatch(r"poles\[\d+\]\.re", k) is not None
         else:
-            ok = (k.startswith(PREFIXES.get(kind, (kind,))) and ".phase_deg" not in k
+            # ".approx" holds the textbook approximation the solver prints alongside its exact answer.
+            # It must never grade the problem: otherwise a wrong exact value passes on the formula's back.
+            ok = (k.startswith(PREFIXES.get(kind, (kind,))) and ".phase_deg" not in k and ".approx" not in k
                   and ".dc_gain" not in k and "[" not in k)
         if ok:
             out.append((k, float(v)))
@@ -111,7 +130,10 @@ def check_expectation(exp: Dict[str, Any], numeric: Dict, symbolic: Dict, tol: f
     for k, v in cands:
         got = abs(v) if use_abs else v
         target = abs(want) if use_abs else want
-        if abs(got - target) <= tol * max(abs(target), 1e-12):
+        # an expected 0 (a diode that does not conduct, a clamped minimum) has no relative scale:
+        # there "tol" is read as an absolute volt / amp limit instead
+        limit = tol * abs(target) if target else tol
+        if abs(got - target) <= limit:
             return True, f"{k} = {v:.6g}"
     shown = ", ".join(f"{k}={v:.4g}" for k, v in cands) or "no answer of this kind"
     return False, f"want {kind} = {want:g}; got {shown}"

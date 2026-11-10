@@ -148,7 +148,7 @@ class DiodeSolver(BaseSolver):
         if "D" not in types:
             return False, ""
         if types & {"Q", "M"}:
-            return False, "Transistor circuits come in Phase 3 (steps 3-5)"
+            return False, ""                      # the transistor solver handles (or explains) these
         if nl.analysis == AnalysisType.CONCEPTUAL:
             return False, "Conceptual question: no circuit to solve"
         if nl.analysis == AnalysisType.TRANSIENT:
