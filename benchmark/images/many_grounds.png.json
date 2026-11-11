@@ -1,0 +1,12 @@
+{
+ "category": "clean",
+ "question": "",
+ "expect": [
+  {
+   "kind": "gain",
+   "value": 5.7,
+   "tol": 0.01
+  }
+ ],
+ "work": "non-inverting amp: Av = 1 + Rf/R1 = 1 + 47/10 = 5.7"
+}

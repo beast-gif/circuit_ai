@@ -1,0 +1,12 @@
+{
+ "category": "clean",
+ "question": "",
+ "expect": [
+  {
+   "kind": "I",
+   "value": 0.0093,
+   "abs": true
+  }
+ ],
+ "work": "I = (10 - 0.7)/1k = 9.3 mA"
+}

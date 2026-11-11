@@ -1,0 +1,17 @@
+{
+ "category": "clean",
+ "question": "",
+ "expect": [
+  {
+   "kind": "IC",
+   "value": 0.00128633,
+   "tol": 0.02
+  },
+  {
+   "kind": "VCE",
+   "value": 7.87087,
+   "tol": 0.02
+  }
+ ],
+ "work": "VBB = 2.105 V, RBB = 8.246k, IB = 12.86 uA, IC = 1.286 mA, VCE = 7.871 V"
+}

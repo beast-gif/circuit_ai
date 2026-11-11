@@ -1,0 +1,17 @@
+{
+ "category": "photo",
+ "question": "",
+ "expect": [
+  {
+   "kind": "V",
+   "value": 7.5,
+   "tol": 0.01
+  },
+  {
+   "kind": "V",
+   "value": 5.0,
+   "tol": 0.01
+  }
+ ],
+ "work": "two separate dividers from the same 10 V: x = 10*3/4 = 7.5 V, y = 10*2/4 = 5 V. If the hop is read as a junction, node x is tied to the 10 V feed and becomes 10 V"
+}

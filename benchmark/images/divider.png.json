@@ -1,0 +1,11 @@
+{
+ "category": "clean",
+ "question": "",
+ "expect": [
+  {
+   "kind": "V",
+   "value": 8.0
+  }
+ ],
+ "work": "12 V across 2k + 4k: V(A) = 12*4/6 = 8 V"
+}

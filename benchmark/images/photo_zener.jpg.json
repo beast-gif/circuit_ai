@@ -1,0 +1,18 @@
+{
+ "category": "photo",
+ "question": "",
+ "expect": [
+  {
+   "kind": "V",
+   "value": 6.2,
+   "tol": 0.01
+  },
+  {
+   "kind": "I",
+   "value": 0.00598182,
+   "abs": true,
+   "tol": 0.02
+  }
+ ],
+ "work": "V = 6.2 V, I(Rs) = 8.8 mA, I(RL) = 2.818 mA, IZ = 5.982 mA"
+}

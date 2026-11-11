@@ -31,6 +31,9 @@ _PREFIX = {
     "n": 1e-9, "p": 1e-12, "f": 1e-15,
 }
 _NUM = re.compile(r"^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(.*?)\s*$")
+# RKM / BS 1852 notation, which is what is actually printed on schematics and components:
+# the prefix letter stands in for the decimal point.  2k2 = 2.2 k, 4R7 = 4.7, R47 = 0.47, 1M5 = 1.5 M.
+_RKM = re.compile(r"^\s*(\d*)\s*([RrKkMGTmuU\u00b5\u03bcnpf])\s*(\d+)\s*$")
 _SYMBOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -38,7 +41,15 @@ def parse_value(raw: Union[str, int, float]) -> float:
     """Convert an engineering-notation string to a float (SI units)."""
     if isinstance(raw, (int, float)):
         return float(raw)
-    m = _NUM.match(str(raw))
+    text = str(raw).strip()
+    rkm = _RKM.match(text)
+    if rkm:                                   # "2k2", "4R7", "R47": the letter IS the decimal point
+        whole, letter, frac = rkm.group(1) or "0", rkm.group(2), rkm.group(3)
+        mult = 1.0 if letter in ("R", "r") else _PREFIX.get(letter)
+        if mult is None:
+            raise ValueError(f"Cannot parse value: {raw!r}")
+        return (float(whole) + float(frac) / 10 ** len(frac)) * mult
+    m = _NUM.match(text)
     if not m:
         raise ValueError(f"Cannot parse value: {raw!r}")
     number = float(m.group(1))
@@ -50,6 +61,12 @@ def parse_value(raw: Union[str, int, float]) -> float:
     first = rest[0]
     if first == "F" and len(rest) == 1:          # "1F" -> one farad
         return number
+    if rest[1:2].isdigit():
+        # a digit after the prefix is a value this would silently truncate ("2k2" read as 2 k), and a
+        # truncated value is worse than no value at all: it produces a confident wrong answer.
+        raise ValueError(f"Cannot parse value: {raw!r}. Write it as a number with one prefix "
+                         f"(\"2.2k\"), or in the printed form where the prefix is the decimal point "
+                         f"(\"2k2\").")
     return number * _PREFIX.get(first, 1.0)      # unit letters (V, A, Ω, H, Hz) -> x1
 
 

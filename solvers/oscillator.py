@@ -32,6 +32,7 @@ For the classic circuits this reproduces the textbook results exactly:
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -40,13 +41,108 @@ import sympy as sp
 from schemas import AnalysisType, Component, Netlist, SolveResult, StepTrace, is_symbolic
 from solvers.base import BaseSolver, NotSupportedError, SolverError, fmt_num, fmt_si, sig_figs
 from solvers.mna import GROUND, MNA, s as S
+from solvers.relaxation import astable_shape
 
 W = sp.Symbol("w_osc", positive=True)
+AMPLIFIERS = ("OPAMP", "E", "G", "F", "H")      # an op-amp, or a transistor's small-signal model
+_GM_KEYS = ("gm", "g_m", "transconductance")
+_IC_KEYS = ("ic", "i_c", "id", "i_d", "iq", "i_q")
+_BETA_KEYS = ("beta", "hfe", "bf", "b")
 KINDS = {"fosc", "f0", "barkhausen", "gain_condition", "oscillates"}
 _Q = re.compile(r"^(\w+)\((\w+)(?:,(\w+))?\)$")
 _OSC_WORD = re.compile(r"\boscillat|\bbarkhausen\b|\bwien\b|\bphase[- ]shift\b|\bcolpitts\b|\bhartley\b|"
                        r"\btwin[- ]?t\b", re.IGNORECASE)
 SUSTAINED = 1e-6            # |real part| <= this * |imaginary part| counts as "on the axis"
+
+
+def _params(c: Component) -> Dict[str, float]:
+    out = {}
+    for k, v in (c.params or {}).items():
+        try:
+            out[str(k).strip().lower().replace(" ", "_").replace("-", "_")] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _gm_raw(c: Component) -> Optional[str]:
+    """A gm given as a SYMBOL rather than a number: params {"gm": "gm"} is the natural way to write
+    "what transconductance does this transistor need?", so it is accepted as the unknown."""
+    for k, v in (c.params or {}).items():
+        if str(k).strip().lower().replace(" ", "_").replace("-", "_") in _GM_KEYS and is_symbolic(str(v)):
+            return str(v).strip()
+    return None
+
+
+def _gm_of(c: Component, VT: float = 0.025) -> Optional[float]:
+    """gm straight from the question: given directly, or from the bias current (gm = I_C/V_T for a BJT)."""
+    p = _params(c)
+    for k in _GM_KEYS:
+        if p.get(k):
+            return p[k]
+    for k in _IC_KEYS:
+        if p.get(k):
+            if c.type.value == "Q":
+                return p[k] / VT                              # gm = I_C / V_T
+            kp = next((p[x] for x in ("k", "kprime", "k_prime", "kn", "kp", "k2") if p.get(x)), None)
+            if kp:
+                return math.sqrt(2 * kp * p[k])                # gm = sqrt(2·k·I_D)
+    return None
+
+
+def _small_signal(nl: Netlist, conv: Dict, trace: StepTrace) -> List[Component]:
+    """Replace each transistor by its small-signal model, which is what the AC equivalent circuit of an LC
+    oscillator is drawn with anyway:
+
+        BJT  : a transconductance  i_c = gm·v_be  from collector to emitter, plus r_π = β/gm base-emitter
+        FET  : a transconductance  i_d = gm·v_gs  from drain to source (the gate draws no current)
+
+    The DC bias is NOT solved here: an oscillator netlist is the AC equivalent and carries no supply, so the
+    question has to give gm (or the bias current it comes from).
+    """
+    VT = float(((conv or {}).get("semiconductor") or {}).get("VT", 0.025))
+    out: List[Component] = []
+    for c in nl.components:
+        if c.type.value not in ("Q", "M"):
+            out.append(c)
+            continue
+        gm = _gm_of(c, VT)
+        sym = _gm_raw(c)
+        if gm is None and sym is None:
+            raise SolverError(f"{c.id}: no gm given, so its small-signal model cannot be built")
+        gm_val = sym if sym else repr(gm)
+        gm_txt = sym if sym else fmt_si(gm, "S")
+        p = _params(c)
+        if c.type.value == "Q":
+            col, base, emit = c.nodes
+            out.append(Component(id=f"{c.id}_gm", type="G", nodes=[col, emit, base, emit], value=gm_val))
+            beta = next((p[k] for k in _BETA_KEYS if p.get(k)), None)
+            note = ""
+            if beta and gm:
+                out.append(Component(id=f"{c.id}_rpi", type="R", nodes=[base, emit], value=repr(beta / gm)))
+                note = f", r_π = β/gm = {fmt_si(beta / gm, 'Ω')}"
+            trace.add(f"Replace {c.id} by its small-signal model (the AC equivalent circuit)",
+                      f"i_c = gm·v_be with gm = {gm_txt}{note}",
+                      "the collector becomes a current source controlled by the base-emitter voltage"
+                      + ("" if beta else "; with no β given, r_π is taken as infinite"))
+        else:
+            drain, gate, src = c.nodes
+            out.append(Component(id=f"{c.id}_gm", type="G", nodes=[drain, src, gate, src], value=gm_val))
+            trace.add(f"Replace {c.id} by its small-signal model (the AC equivalent circuit)",
+                      f"i_d = gm·v_gs with gm = {gm_txt}",
+                      "the gate draws no current, so there is no r_π")
+    return out
+
+
+def _unit(c: Optional[Component]) -> str:
+    """The unit the solved-for value is printed in: a resistor in Ω, a transconductance in S."""
+    if c is None:
+        return ""
+    return {"R": "Ω", "C": "F", "L": "H", "G": "S", "E": "", "F": "", "H": "Ω"}.get(c.type.value, "")
+
+
+# public alias: the verifier needs the same substitution before it can hand the circuit to ngspice
+small_signal_circuit = _small_signal
 
 
 def _free_values(nl: Netlist) -> List[Component]:
@@ -60,7 +156,7 @@ class OscillatorSolver(BaseSolver):
               "the Barkhausen phase and magnitude conditions, which give w0 and the gain needed")
 
     def supports(self, nl: Netlist) -> Tuple[bool, str]:
-        ops = [c for c in nl.components if c.type.value == "OPAMP"]
+        ops = [c for c in nl.components if c.type.value in AMPLIFIERS]
         kinds = {(_Q.match(q.replace(" ", "")).group(1) if _Q.match(q.replace(" ", "")) else q.replace(" ", ""))
                  for q in nl.query}
         asked = bool(kinds & KINDS) and (kinds & {"fosc", "barkhausen", "gain_condition", "oscillates"}
@@ -69,11 +165,29 @@ class OscillatorSolver(BaseSolver):
         looks_like = bool(ops) and not sources and bool(_OSC_WORD.search(nl.question or ""))
         if not (asked or looks_like):
             return False, ""
-        if any(c.type.value in ("D", "Q", "M") for c in nl.components):
-            return False, ("Oscillators with diodes or transistors in the loop are not supported yet: "
-                           "this step covers op-amp RC oscillators")
-        if not ops:
-            return False, "An oscillator needs the amplifier in the netlist (an op-amp in this step)"
+        op = astable_shape(nl)
+        if op is not None:
+            # A square-wave generator is source-free and asked about with "fosc" too, but it is NOT a linear
+            # feedback loop: its output sits at a rail and the period comes from the RC charging time. Say
+            # that, rather than reporting that the poles are real.
+            return False, (f"{op.id} is wired as an astable multivibrator (positive feedback to its + input "
+                           f"and the timing capacitor on its − input), which is a relaxation oscillator, not "
+                           f"a linear one: det A(s) = 0 does not describe it. The relaxation solver handles "
+                           f"it -- if you are seeing this message, check that solvers/__init__.py lists "
+                           f"RelaxationSolver in SOLVERS.")
+        if any(c.type.value == "D" for c in nl.components):
+            return False, ("Oscillators with diodes in the loop (amplitude-limiting networks) are not "
+                           "supported yet: leave the limiting diodes out and ask for the frequency")
+        if any(c.type.value in ("Q", "M") for c in nl.components) and not ops:
+            # a transistor is allowed, but only as its small-signal model, which needs gm
+            for c in nl.components:
+                if c.type.value in ("Q", "M") and _gm_of(c) is None and _gm_raw(c) is None:
+                    return False, (f"{c.id}: a transistor oscillator is solved from the small-signal model, "
+                                   f"so give gm (or I_C / I_D, from which gm = I_C/V_T). A DC bias cannot be "
+                                   f"found here: the netlist is the AC equivalent circuit and has no supply.")
+        if not ops and not any(c.type.value in ("Q", "M") for c in nl.components):
+            return False, ("An oscillator needs its amplifier in the netlist: an op-amp, a transistor, or the "
+                           "transistor's small-signal model as a G (transconductance) element")
         if sources:
             return False, ("An oscillator has no input source. Remove the source from the netlist: the "
                            "oscillation comes from the feedback loop itself")
@@ -95,7 +209,8 @@ class _OscJob:
         self.trace = StepTrace()
         self.res = SolveResult(method=OscillatorSolver.method)
         self.queries = [q.replace(" ", "") for q in nl.query]
-        self.ops = [c for c in nl.components if c.type.value == "OPAMP"]
+        self.ops = [c for c in nl.components if c.type.value in AMPLIFIERS]
+        self.comps = list(nl.components)
 
     # ------------------------------------------------------------------
     def _char_poly(self, comps: List[Component]) -> sp.Expr:
@@ -120,18 +235,29 @@ class _OscJob:
 
     # ------------------------------------------------------------------
     def _feedback_resistor(self) -> Optional[Component]:
-        """The resistor from the output to the − input: the one that sets the amplifier's gain."""
-        for op in self.ops:
+        """The resistor from an op-amp's output to its − input: the one that sets the amplifier's gain."""
+        for op in [c for c in self.ops if c.type.value == "OPAMP"]:
             out, inm = op.nodes[0], op.nodes[2]
             for c in self.nl.components:
                 if c.type.value == "R" and set(c.nodes[:2]) == {out, inm}:
                     return c
         return None
 
+    def _gain_element(self) -> Optional[Component]:
+        """What to solve for when the gain is too low: an op-amp's feedback resistor, or -- in an LC
+        oscillator built round a transistor -- the transconductance itself ("what gm is needed?")."""
+        rf = self._feedback_resistor()
+        if rf is not None:
+            return rf
+        gs = [c for c in self.comps if c.type.value in ("E", "G", "F", "H")]
+        return gs[0] if len(gs) == 1 else None
+
     def _gain_partner(self, rf: Component) -> Optional[Component]:
         """The other resistor at the − input: the ratio Rf/this is the gain condition textbooks quote."""
-        op = self.ops[0]
-        inm = op.nodes[2]
+        ops = [c for c in self.ops if c.type.value == "OPAMP"]
+        if not ops or rf.type.value != "R":
+            return None
+        inm = ops[0].nodes[2]
         for c in self.nl.components:
             if c.type.value == "R" and c.id != rf.id and inm in c.nodes[:2]:
                 return c
@@ -142,7 +268,14 @@ class _OscJob:
         """Both Barkhausen equations at once: returns (w0, the value the unknown must have)."""
         poly = self._char_poly(comps)
         re_part, im_part = self._split(poly)
-        x = sp.Symbol(str(unknown.value), positive=True)
+        # Take the symbol OUT of the polynomial rather than building a new one: MNA makes a resistance
+        # positive=True but a transconductance only real=True, and Symbol("gm", positive=True) is a
+        # different symbol from Symbol("gm", real=True), which would leave nothing to solve for.
+        name = str(unknown.value).strip()
+        x = next((f for f in poly.free_symbols if f.name == name), None)
+        if x is None:
+            raise SolverError(f"{unknown.id}'s value '{name}' does not appear in the characteristic "
+                              f"equation, so it cannot be solved for")
         self.trace.add("Set the characteristic equation det A(jw) = 0 and split it into real and imaginary parts",
                        f"Im: {sp.nsimplify(im_part)} = 0  (phase condition)\n"
                        f"          Re: {sp.nsimplify(re_part)} = 0  (magnitude condition)",
@@ -163,11 +296,56 @@ class _OscJob:
                               "(the loop has no reactive elements)")
         return [complex(r) for r in sp.nroots(p, n=20)]
 
+    def _val(self, c: Component) -> Optional[float]:
+        try:
+            return float(sp.N(MNA(self.comps, "ac", conventions=self.conv).value(c)))
+        except (SolverError, TypeError, ValueError):
+            return None
+
+    def _textbook_lc(self, f0: float) -> bool:
+        """LC oscillators: a tapped tank. Colpitts taps the capacitance, Hartley the inductance.
+
+            Colpitts   two C and one L   ->   f0 = 1/(2*pi*sqrt(L*C1*C2/(C1+C2)))
+            Hartley    two L and one C   ->   f0 = 1/(2*pi*sqrt((L1+L2)*C))
+
+        The tap divides the tank, so the feedback ratio is fixed by the component ratio, and the amplifier
+        only has to make up for it: gm*R = (the ratio of the element at the input to the one at the output).
+        """
+        ls = [c for c in self.comps if c.type.value == "L"]
+        cs = [c for c in self.comps if c.type.value == "C"]
+        vals_l = [self._val(c) for c in ls]
+        vals_c = [self._val(c) for c in cs]
+        if any(v is None for v in vals_l + vals_c):
+            return False
+        if len(cs) == 2 and len(ls) == 1:
+            name = "Colpitts"
+            eq = vals_c[0] * vals_c[1] / (vals_c[0] + vals_c[1])
+            f_book = 1 / (2 * 3.141592653589793 * math.sqrt(vals_l[0] * eq))
+            how = (f"C_eq = C1·C2/(C1+C2) = {fmt_si(eq, 'F')} in series with L = {fmt_si(vals_l[0], 'H')}; "
+                   f"f0 = 1/(2·π·√(L·C_eq))")
+        elif len(ls) == 2 and len(cs) == 1:
+            name = "Hartley"
+            eq = vals_l[0] + vals_l[1]
+            f_book = 1 / (2 * 3.141592653589793 * math.sqrt(eq * vals_c[0]))
+            how = (f"L_eq = L1 + L2 = {fmt_si(eq, 'H')} with C = {fmt_si(vals_c[0], 'F')}; "
+                   f"f0 = 1/(2·π·√(L_eq·C))")
+        else:
+            return False
+        self.res.numeric["fosc.approx"] = f_book
+        self.trace.add(f"This is the classic {name} oscillator: a tapped tank, so the book's formula applies",
+                       how,
+                       f"textbook f0 = {fmt_si(f_book, 'Hz', self.sig)} "
+                       f"({'agrees' if abs(f_book - f0) < 0.01 * f_book else 'differs'} with the determinant)")
+        return True
+
     # ------------------------------------------------------------------
     def _textbook(self, w0: float) -> None:
         """Name the topology and compare with the formula from the book, when the parts are all equal."""
-        rs = [c for c in self.nl.components if c.type.value == "R"]
-        cs = [c for c in self.nl.components if c.type.value == "C"]
+        f0 = w0 / (2 * 3.141592653589793)
+        if self._textbook_lc(f0):
+            return
+        rs = [c for c in self.comps if c.type.value == "R"]
+        cs = [c for c in self.comps if c.type.value == "C"]
         rf = self._feedback_resistor()
         loop_r = [c for c in rs if rf is None or c.id != rf.id]
         vals_r = {str(c.value) for c in loop_r}
@@ -175,8 +353,8 @@ class _OscJob:
         if len(vals_c) != 1 or len(vals_r) > 2:
             return
         try:
-            R = float(sp.N(MNA(self.nl.components, "ac", conventions=self.conv).value(loop_r[0])))
-            C = float(sp.N(MNA(self.nl.components, "ac", conventions=self.conv).value(cs[0])))
+            R = float(sp.N(MNA(self.comps, "ac", conventions=self.conv).value(loop_r[0])))
+            C = float(sp.N(MNA(self.comps, "ac", conventions=self.conv).value(cs[0])))
         except (SolverError, IndexError):
             return
         if len(cs) == 2:
@@ -197,14 +375,16 @@ class _OscJob:
 
     # ------------------------------------------------------------------
     def run(self) -> SolveResult:
-        comps = list(self.nl.components)
+        comps = _small_signal(self.nl, self.conv, self.trace)
+        self.comps = comps
         for op in self.ops:
             self.trace.add(f"{op.id} is the amplifier; the loop has no input source, so the circuit is "
                            f"source-free and A(s)·x = 0",
                            "a non-zero output with no input is only possible where det A(s) = 0",
                            "that determinant is the characteristic equation of the circuit")
 
-        unknowns = _free_values(self.nl)
+        unknowns = _free_values(Netlist(analysis=self.nl.analysis, query=self.nl.query,
+                                        question=self.nl.question, components=comps))
         if len(unknowns) > 1:
             raise SolverError("More than one component value is left as a symbol ("
                               + ", ".join(c.id for c in unknowns)
@@ -218,7 +398,7 @@ class _OscJob:
             w0, x_needed = self._solve_symbolic(comps, unknown)
             self.trace.add("Solve the two equations together",
                            f"w0 = {fmt_num(w0, self.sig)} rad/s,  {unknown.id} = "
-                           f"{fmt_si(x_needed, 'Ω' if unknown.type.value == 'R' else '', self.sig)}",
+                           f"{fmt_si(x_needed, _unit(unknown), self.sig)}",
                            f"the loop oscillates at f0 = {fmt_si(w0 / (2 * 3.141592653589793), 'Hz', self.sig)} "
                            f"when {unknown.id} has exactly that value")
         else:
@@ -242,16 +422,17 @@ class _OscJob:
                            f"s = {fmt_num(p.real, self.sig)} ± j{fmt_num(abs(p.imag), self.sig)} rad/s",
                            f"the real part is {kind}")
             if p.real < -SUSTAINED * abs(p.imag):
-                rf = self._feedback_resistor()
+                rf = self._gain_element()
                 if rf is not None:
-                    sym = [Component(**{**c.model_dump(), "value": "Rf_needed"}) if c.id == rf.id else c
+                    unit = "Ω" if rf.type.value == "R" else ("S" if rf.type.value == "G" else "")
+                    sym = [Component(**{**c.model_dump(), "value": "x_needed"}) if c.id == rf.id else c
                            for c in comps]
                     try:
                         w_need, rf_need = self._solve_symbolic(sym, next(c for c in sym if c.id == rf.id))
                         self.res.numeric["gain_condition"] = rf_need
                         self.trace.add(f"Ask what {rf.id} would have to be",
                                        f"re-solve the same two equations with {rf.id} as the unknown",
-                                       f"{rf.id} = {fmt_si(rf_need, 'Ω', self.sig)} would put the poles on the "
+                                       f"{rf.id} = {fmt_si(rf_need, unit, self.sig)} would put the poles on the "
                                        f"axis (f0 = {fmt_si(w_need / (2 * 3.141592653589793), 'Hz', self.sig)})")
                     except SolverError:
                         pass
@@ -278,7 +459,7 @@ class _OscJob:
                 self.res.numeric[q] = f0
             elif kind == "gain_condition":
                 if unknown is not None:
-                    partner = self._gain_partner(unknown) if unknown.type.value == "R" else None
+                    partner = self._gain_partner(unknown)
                     ratio = ""
                     if partner is not None:
                         try:
@@ -286,11 +467,12 @@ class _OscJob:
                             ratio = f"  ({unknown.id}/{partner.id} = {fmt_num(x_needed / pv, self.sig)})"
                         except SolverError:
                             ratio = ""
-                    self.res.answers[q] = fmt_si(x_needed, "Ω", self.sig) + ratio
+                    self.res.answers[q] = fmt_si(x_needed, _unit(unknown), self.sig) + ratio
                     self.res.numeric[q] = x_needed
                 elif "gain_condition" in self.res.numeric:
-                    self.res.answers[q] = (fmt_si(self.res.numeric["gain_condition"], "Ω", self.sig)
-                                           + " (the value the feedback resistor needs)")
+                    el = self._gain_element()
+                    self.res.answers[q] = (fmt_si(self.res.numeric["gain_condition"], _unit(el), self.sig)
+                                           + f" (the value {el.id if el else 'the gain element'} needs)")
                 else:
                     self.res.answers[q] = ("already satisfied: the poles sit on the jw axis with the values "
                                            "given" if grows is not None and abs(grows) <= SUSTAINED * w0 else

@@ -1,0 +1,11 @@
+{
+ "category": "clean",
+ "question": "",
+ "expect": [
+  {
+   "kind": "V",
+   "value": -10.0
+  }
+ ],
+ "work": "inverting amp, Av = -Rf/Rin = -10 so vo = -10 V. The op-amp is drawn FLIPPED, with + on the bottom: reading the inputs the other way gives +11 V"
+}

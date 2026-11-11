@@ -41,7 +41,7 @@ _Q_DEV = re.compile(r"^(IC|IB|IE|VCE|VBE|VEC|VEB|region|gm|rpi|ro|re)\((\w+)\)$"
 _Q_FET = re.compile(r"^(ID|IS|IG|VGS|VDS|VSG|VSD|VOV)\((\w+)\)$")                  # ID(M1), VDS(M1): MOSFET
 _Q_STATE = re.compile(r"^state\((\w+)\)$")                                        # state(U1): comparator
 _Q_BARE = re.compile(r"^(Rin|Rout|gain|fc|f0|poles|zeros|tau|Qfactor|bandwidth|filter|VTH|VTL|hysteresis|"
-                     r"trip|fosc|barkhausen|gain_condition|oscillates)$")
+                     r"trip|fosc|barkhausen|gain_condition|oscillates|period|duty|T_high|T_low)$")
 _Q_WAVE_V = re.compile(r"^(Vmax|Vmin|Vavg|Vrms|vtc|Vripple|Vpp|ripple)\((\w+)(?:,(\w+))?\)$")   # waveform of a node: Vavg(out)
 _Q_WAVE_C = re.compile(r"^(Imax|Iavg|Irms|PIV|conduction)\((\w+)\)$")       # of a component: PIV(D1)
 

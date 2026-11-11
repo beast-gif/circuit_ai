@@ -22,10 +22,22 @@ def offline_checks() -> bool:
     # --- value parsing ---
     cases = {"1k": 1e3, "2.2k": 2.2e3, "4.7uF": 4.7e-6, "10mA": 1e-2, "1M": 1e6,
              "1meg": 1e6, "100n": 1e-7, "15pF": 1.5e-11, "10V": 10.0, "1F": 1.0,
-             "5Ω": 5.0, "1e3": 1e3, 47: 47.0}
+             "5Ω": 5.0, "1e3": 1e3, 47: 47.0,
+             # RKM / BS 1852: the prefix letter stands in for the decimal point, which is how values
+             # are actually printed on schematics and on the parts themselves
+             "2k2": 2.2e3, "4R7": 4.7, "R47": 0.47, "1M5": 1.5e6, "2u2": 2.2e-6, "10k5": 10.5e3}
     for raw, want in cases.items():
         got = parse_value(raw)
         ok &= check(f"parse_value({raw!r}) = {want:g}", abs(got - want) <= 1e-12 * max(1, abs(want)))
+
+    # a value with a digit after the prefix that is NOT valid RKM must raise, never silently truncate:
+    # reading "2k2x" as 2 k would give a confident wrong answer
+    for bad in ("2k2x", "1k5m"):
+        try:
+            parse_value(bad)
+            ok &= check(f"parse_value({bad!r}) raises", False, "no error")
+        except ValueError:
+            ok &= check(f"parse_value({bad!r}) raises", True)
 
     # --- valid voltage-divider netlist ---
     divider = Netlist(

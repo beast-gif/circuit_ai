@@ -10,6 +10,7 @@ hand-worked answers.
     python benchmark/run_benchmark.py --file benchmark/opamp.jsonl   # Phase 2: op-amps + active filters
     python benchmark/run_benchmark.py --file benchmark/phase3.jsonl  # Phase 3: diodes, rectifiers, BJT, MOSFET, comparators
     python benchmark/run_benchmark.py --file benchmark/phase3.jsonl --ids bjt,amp   # one topic group
+    python benchmark/run_benchmark.py --file benchmark/phase4.jsonl  # Phase 4: oscillators (Wien, phase shift, Colpitts, Hartley, astable)
 
 Matching is by KIND, not by exact query name, because the parser may call a node "out" or "n2":
 an expectation {"kind": "V", "value": 8} passes if ANY V(...) answer is within --tol (default 1 %)

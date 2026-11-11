@@ -40,10 +40,11 @@ import numpy as np
 import sympy as sp
 
 from llm_client import load_config, load_conventions
-from schemas import AnalysisType, Component, Netlist, SolveResult, is_symbolic, parse_value
+from schemas import AnalysisType, Component, Netlist, SolveResult, StepTrace, is_symbolic, parse_value
 from solvers.bjt import resolve_bjt
 from solvers.diode import resolve_diode
 from solvers.mna import resolve_opamp
+from solvers.oscillator import small_signal_circuit
 from solvers.mosfet import resolve_mosfet
 from solvers.base import fmt_complex, fmt_num, fmt_si
 
@@ -310,6 +311,8 @@ class Verifier:
         self.bjts: Dict[str, Tuple[object, str]] = {}
         self.fets: Dict[str, Tuple[object, str, tuple]] = {}
         orig = self.orig = nl
+        if "w_osc" in res.numeric and not self.indep:
+            return self._verify_osc(nl, res, rep)               # oscillators: measure the real thing
         if nl.analysis in (AnalysisType.SMALL_SIGNAL, AnalysisType.AC) and any(
                 c.type.value in ("Q", "M") for c in nl.components):
             return self._verify_amp(nl, res, rep)               # small-signal BJT amplifier
@@ -918,6 +921,155 @@ class Verifier:
     # ------------------------------------------------------------------
     # Small-signal BJT amplifier: ngspice solves the real nonlinear circuit and linearises it itself
     # ------------------------------------------------------------------
+    def _verify_osc(self, nl: Netlist, res: SolveResult, rep: VerifyReport) -> VerifyReport:
+        """Check an oscillator the way a lab does: build it, kick it, and watch.
+
+        The solver's claim came from det A(s) = 0 -- a pole at s = sigma ± j*w0. ngspice knows nothing about
+        that determinant: it integrates the circuit in time from a charged capacitor, with the op-amp as a
+        plain VCVS. Two things are then measured off V(out) and compared with the two parts of the pole:
+            the spacing of the zero crossings  -> the frequency w0
+            the slope of ln(peak) against t    -> the real part sigma (growing, steady or dying)
+        A circuit designed for oscillation must hold a constant amplitude over several cycles; one whose
+        gain is wrong must visibly grow or decay at the predicted rate.
+        """
+        def done(why: str) -> VerifyReport:
+            rep.notes.append(why)
+            res.verified = None
+            res.verification_notes.append(f"not verified: {why}")
+            return rep
+
+        if self.exe is None:
+            return done("ngspice not found (set solver.ngspice_path in config.yaml)")
+        w0 = res.numeric.get("w_osc")
+        if not w0 or w0 <= 0:
+            return done("the solver reported no oscillation frequency")
+        f0 = w0 / (2 * math.pi)
+        T = 1 / f0
+        sigma = res.numeric.get("pole.re")
+
+        # An LC oscillator's netlist holds a transistor; ngspice cannot bias it (there is no supply here),
+        # so substitute the same small-signal model the solver used -- that IS the circuit being analysed.
+        try:
+            base = small_signal_circuit(nl, self.conv, StepTrace())
+        except Exception as e:                       # noqa: BLE001 - any model problem means "cannot check"
+            return done(f"the small-signal model could not be built for ngspice: {str(e)[:200]}")
+
+        # A design question leaves one value symbolic; simulate it with the value the solver says it needs,
+        # which is the real test: at that value the amplitude must stay constant.
+        comps, designed = [], ""
+        for c in base:
+            if c.value not in (None, "") and is_symbolic(c.value):
+                need = res.numeric.get("gain_condition")
+                if need is None:
+                    return done(f"{c.id} has no numeric value to simulate")
+                comps.append(c.model_copy(update={"value": _num(need)}))
+                designed = c.id
+            else:
+                comps.append(c)
+        if designed:
+            sigma = 0.0                     # built to the condition: the poles should sit on the jw axis
+        nl = nl.model_copy(update={"components": comps})
+
+        caps = [c for c in comps if c.type.value == "C"]
+        if not caps:
+            return done("no capacitor to charge, so there is nothing to kick")
+        out = next((c.nodes[0] for c in comps if c.type.value == "OPAMP"), None)
+        if out is None:
+            return done("no op-amp output to watch")
+
+        # Kick: 1 mV on one capacitor, 0 V on the rest. Small, so that a circuit whose amplitude grows for
+        # six cycles does not reach absurd voltages, and large enough to be far above round-off.
+        kick = min(caps, key=lambda c: 0 if GROUND in c.nodes[:2] else 1)
+        extra = [f"C_{c.id} {c.nodes[0]} {c.nodes[1]} {_num(parse_value(c.value))} "
+                 f"IC={_num(1e-3 if c.id == kick.id else 0.0)}" for c in caps]
+        extra.append(".options reltol=1e-5 abstol=1e-14 vntol=1e-12")
+        rest = nl.model_copy(update={"components": [c for c in comps if c.type.value != "C"]})
+
+        cycles, step = 6, T / 2000
+        ctl = _Ctl()
+        ctl.cmd(f"tran {_num(step)} {_num(cycles * T)} 0 {_num(step)} uic")
+        ctl.cmd(f"let w0 = {vexpr(out)}")
+        ctl.cmd("wrdata osc.txt w0")
+        try:
+            deck = build_deck(rest, {}, extra=extra, conventions=self.conv)
+            _, data = self.run(deck, ctl.lines, files=["osc.txt"])
+        except (SpiceError, _Skip) as e:
+            return done(f"ngspice failed: {str(e)[:300]}")
+
+        rows = []
+        for line in data["osc.txt"].splitlines():
+            try:
+                parts = [float(p) for p in line.split()]
+            except ValueError:
+                continue
+            if len(parts) >= 2:
+                rows.append(parts[:2])
+        if len(rows) < 500 or rows[-1][0] < 0.9 * cycles * T:
+            return done("ngspice transient gave too few points to measure a period")
+        t = np.array([r[0] for r in rows])
+        v = np.array([r[1] for r in rows])
+
+        # --- frequency from the zero crossings (skip the first half cycle: the kick settles there)
+        start = t > 0.5 * T
+        tt, vv = t[start], v[start]
+        sign = np.sign(vv)
+        idx = np.where((sign[:-1] != 0) & (sign[1:] != 0) & (sign[:-1] != sign[1:]))[0]
+        if len(idx) < 4:
+            return done("ngspice saw fewer than two cycles: nothing to measure")
+        zc = tt[idx] + (tt[idx + 1] - tt[idx]) * (-vv[idx]) / (vv[idx + 1] - vv[idx])
+        half = np.diff(zc)
+        f_spice = 1.0 / (2.0 * float(np.mean(half)))
+        rep.checks.append(self._cmp("fosc (ngspice period)", f0, f_spice, "Hz", 0.02))
+
+        # --- real part from the envelope: fit ln|peak| against the peak times
+        peaks_t, peaks_v = [], []
+        for i in range(1, len(vv) - 1):
+            if abs(vv[i]) >= abs(vv[i - 1]) and abs(vv[i]) > abs(vv[i + 1]) and abs(vv[i]) > 0:
+                peaks_t.append(tt[i])
+                peaks_v.append(abs(vv[i]))
+        if len(peaks_t) >= 4:
+            slope = float(np.polyfit(np.array(peaks_t), np.log(np.array(peaks_v)), 1)[0])
+            if sigma is None:
+                rep.checks.append(Check("pole.re", "-", fmt_num(slope, 4) + " 1/s", None, "skipped",
+                                        "the solver reported no pole position"))
+            elif abs(sigma) <= 1e-6 * w0:
+                # designed for oscillation: the amplitude must hold. Allow 2 % per cycle of numerical drift.
+                drift = abs(slope) * T
+                rep.checks.append(Check("pole.re = 0 (constant amplitude)", "0 1/s",
+                                        f"{fmt_num(slope, 4)} 1/s", drift,
+                                        "ok" if drift < 0.02 else "MISMATCH",
+                                        f"amplitude changes {drift * 100:.2f} % per cycle in ngspice"))
+            else:
+                # sigma can be a tiny fraction of w0 (a circuit built just off its condition). Judging that
+                # by relative error alone is unfair to the envelope fit, so the comparison gets a floor of
+                # 1 % of w0: what matters there is the sign and the order of magnitude.
+                rep.checks.append(self._cmp("pole.re (ngspice envelope)", sigma, slope, "1/s", 0.15,
+                                            floor=0.01 * w0))
+        else:
+            rep.checks.append(Check("pole.re", "-", "-", None, "skipped", "too few peaks to fit an envelope"))
+
+        rep.notes.append(f"ngspice ran the circuit for {cycles} cycles from a 1 mV charge on {kick.id}, with "
+                         f"the op-amp as a {OPAMP_GAIN:g}x VCVS; it never sees the determinant"
+                         + (f" ({designed} set to the value the solver designed)" if designed else ""))
+        statuses = {c.status for c in rep.checks}
+        rep.verified = False if "MISMATCH" in statuses else (True if "ok" in statuses else None)
+        res.verified = rep.verified
+        for c in rep.checks:
+            if c.status == "MISMATCH":
+                res.verification_notes.append(f"{c.query}: solver {c.solver} vs ngspice {c.spice}")
+            elif c.status == "skipped":
+                res.verification_notes.append(f"{c.query}: not checked ({c.note})")
+        return rep
+
+    def _cmp(self, name: str, solver: float, spice: float, unit: str, tol: float, floor: float = 0.0) -> Check:
+        """One comparison line: relative difference against a tolerance, with a sign check."""
+        scale = max(abs(solver), abs(spice), floor, 1e-30)
+        rel = abs(solver - spice) / scale
+        same_sign = (solver >= 0) == (spice >= 0)
+        return Check(name, fmt_si(solver, unit, 5), fmt_si(spice, unit, 5), rel,
+                     "ok" if rel <= tol and same_sign else "MISMATCH",
+                     "" if rel <= tol and same_sign else f"differ by {rel * 100:.2f} %")
+
     def _verify_amp(self, nl: Netlist, res: SolveResult, rep: VerifyReport) -> VerifyReport:
         """Independent check: ngspice gets the ORIGINAL circuit with real BJTs (Gummel-Poon, the question's β,
         IS chosen so that V_BE comes out at the model's 0.7 V at the solver's bias current) and runs its own

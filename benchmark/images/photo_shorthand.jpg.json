@@ -1,0 +1,12 @@
+{
+ "category": "photo",
+ "question": "",
+ "expect": [
+  {
+   "kind": "fc",
+   "value": 723.4315595086151,
+   "tol": 0.01
+  }
+ ],
+ "work": "2k2 = 2.2 kOhm and 100n = 100 nF: fc = 1/(2*pi*R*C) = 723.43 Hz"
+}

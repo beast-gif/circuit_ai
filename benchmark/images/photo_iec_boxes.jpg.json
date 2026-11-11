@@ -1,0 +1,11 @@
+{
+ "category": "photo",
+ "question": "",
+ "expect": [
+  {
+   "kind": "V",
+   "value": 8.0
+  }
+ ],
+ "work": "the same divider as divider.png, with IEC rectangle resistors: 8 V"
+}

@@ -3,9 +3,10 @@
 TEXT_PARSER_SYSTEM = r"""You convert analog electronics questions into a circuit netlist in JSON.
 You do NOT solve the circuit. You only describe it exactly.
 
-Return ONLY one JSON object with these keys:
+Return ONLY one JSON object with these keys. EVERY key below must be present -- "analysis" above all: it is
+required and has no default, so a JSON object without it is rejected and the whole parse is retried.
 {
-  "analysis":     "dc" | "ac" | "transient" | "small_signal" | "conceptual",
+  "analysis":     "dc" | "ac" | "transient" | "small_signal" | "conceptual",     (REQUIRED, never omit)
   "components":   [ ... ],
   "query":        [ ... ],
   "frequency":    null or "1k"      (single AC frequency in Hz, only if given),
@@ -225,6 +226,21 @@ OSCILLATORS (analysis "ac", and NO source at all)
                        − input is a virtual ground, so such a resistor has 0 V across it and does nothing.
                        Getting this wrong changes the answer (f0 = 1/(2*pi*R*C*sqrt6) and Rf/R = 29 for three
                        complete sections, but 1/(2*pi*R*C*sqrt3) and Rf/R = 12 if a resistor is missing).
+    LC oscillators (Colpitts / Hartley) are drawn as the AC EQUIVALENT circuit: no supply, no coupling or
+    bypass capacitors, the emitter (or source) at ground. The transistor keeps its own line, with gm in
+    "params" (or I_C, from which gm = I_C/V_T; add "beta" if the question gives it, for r_π):
+    Colpitts (CE) : Q1 ["c","b","0"] with params {"gm": 0.001}, C1 ["b","0"], C2 ["c","0"], L ["c","b"],
+                    RL ["c","0"]          (the capacitive divider is tapped at the emitter = ground)
+    Hartley  (CE) : Q1 ["c","b","0"] with params {"gm": 0.001}, L1 ["b","0"], L2 ["c","0"], C ["c","b"],
+                    RL ["c","0"]          (the inductive divider is tapped the same way)
+    If the question asks what gm (or hFE) is needed, write the transistor's model as a G element with its
+    value left as the symbol "gm": G1 ["c","0","b","0"] value "gm", and ask for "gain_condition".
+    An ASTABLE MULTIVIBRATOR (square-wave generator, relaxation oscillator) is a Schmitt trigger with the
+    timing capacitor on the − input. No source, and the rails go in "assumptions" as usual:
+    astable : op-amp ["out","p","n"], R1 ["p","0"], R2 ["out","p"] (positive feedback, sets the trip points),
+              R ["out","n"] (the timing resistor), C ["n","0"] (the timing capacitor)
+    Queries for it: frequency -> "fosc"; period -> "period"; duty cycle -> "duty"; the time the output
+    spends high or low -> "T_high" / "T_low"; the trip points -> "VTH" / "VTL". Use analysis "ac".
 - If the question asks what a resistor must BE for oscillation ("find the value of Rf", "what gain is
   needed"), leave that one component's "value" as its symbol, e.g. {"id": "Rf", "type": "R",
   "nodes": ["n","out"], "value": "Rf"}, and ask for "gain_condition". Only ONE value may be left symbolic.
@@ -462,6 +478,31 @@ for, so its value stays the symbol "Rf".)
    {"id": "Rf", "type": "R", "nodes": ["n", "out"], "value": "Rf"},
    {"id": "U1", "type": "OPAMP", "nodes": ["out", "0", "n"], "model": "ideal"}],
  "query": ["fosc", "gain_condition"], "frequency": null, "assumptions": [], "missing_info": []}
+
+Question: A Colpitts oscillator uses L = 1 mH with C1 = 10 nF at the base and C2 = 100 nF at the collector,
+a collector load of 10 kOhm, and a BJT with gm = 1 mS. Find the frequency of oscillation.
+(The AC equivalent circuit: no supply and no coupling capacitors, the emitter at ground, gm in params.)
+{"analysis": "ac",
+ "components": [
+   {"id": "C1", "type": "C", "nodes": ["b", "0"], "value": "10n"},
+   {"id": "C2", "type": "C", "nodes": ["c", "0"], "value": "100n"},
+   {"id": "L1", "type": "L", "nodes": ["c", "b"], "value": "1m"},
+   {"id": "RL", "type": "R", "nodes": ["c", "0"], "value": "10k"},
+   {"id": "Q1", "type": "Q", "nodes": ["c", "b", "0"], "model": "NPN", "params": {"gm": 0.001}}],
+ "query": ["fosc"], "frequency": null, "assumptions": [], "missing_info": []}
+
+Question: An op-amp astable multivibrator runs from +/-12 V supplies with R1 = 10 kOhm from the
+non-inverting input to ground, R2 = 10 kOhm of positive feedback, a timing resistor R = 10 kOhm and a
+timing capacitor C = 100 nF. Find the frequency of the square wave.
+(The capacitor is on the − input, the divider on the + input; no source.)
+{"analysis": "ac",
+ "components": [
+   {"id": "R1", "type": "R", "nodes": ["p", "0"], "value": "10k"},
+   {"id": "R2", "type": "R", "nodes": ["out", "p"], "value": "10k"},
+   {"id": "R", "type": "R", "nodes": ["out", "n"], "value": "10k"},
+   {"id": "C1", "type": "C", "nodes": ["n", "0"], "value": "100n"},
+   {"id": "U1", "type": "OPAMP", "nodes": ["out", "p", "n"], "model": "ideal"}],
+ "query": ["fosc"], "frequency": null, "assumptions": ["supply +/-12 V"], "missing_info": []}
 """
 
 TEXT_PARSER_USER = "Question:\n{question}\n\nReturn the JSON object only."
@@ -472,3 +513,76 @@ RETRY_FEEDBACK = (
 )
 
 NOT_JSON_FEEDBACK = "Your reply was not a valid JSON object. Return the JSON object only, no other text."
+
+
+# ======================================================================
+# Image parser (Phase 5): a photo or screenshot of a schematic -> the same netlist JSON
+# ======================================================================
+IMAGE_PARSER_SYSTEM = TEXT_PARSER_SYSTEM + r"""
+
+READING A SCHEMATIC FROM AN IMAGE
+Everything above still applies: the JSON format, the templates, the query forms, the rule that you describe
+only what is drawn. What follows is about getting the circuit OFF THE PICTURE correctly. Two extra keys go
+in the JSON when the input is an image:
+  "question_text":  the printed question, copied from the image word for word (""  if the image has none)
+  "reading_notes":  short notes on anything you could not read with confidence, one string each -- an
+                    unreadable value, a wire you are unsure joins, a symbol you had to guess. An empty list
+                    means you are confident about every component, node and value in the drawing.
+
+NODES ARE THE HARD PART, so do this first and do it carefully.
+- A node is a whole piece of wire. Follow every line: all the wire segments connected together -- round
+  corners, through junction dots, along a long rail -- are ONE node with ONE name. Two wires that merely
+  CROSS with no dot are NOT connected.
+- Name a node after the label printed on it (Vcc, Vin, Vo, A, B, node 1 -> "vcc", "in", "out", "a", "b",
+  "n1"). Where nothing is printed, use "in", "out", "b", "c", "e", "n1", "n2"...
+- Ground is "0": the ground symbol (three shrinking horizontal bars, or a triangle, or the chassis hatch),
+  and every wire that reaches one, however far away it is drawn. A circuit can have several ground symbols:
+  they are all the SAME node "0".
+- The two ends of a component are on DIFFERENT nodes unless the drawing shorts them. Before you finish,
+  check each component: its two nodes must be the two wires its leads actually touch.
+- A supply drawn as an arrow or a bare label ("+12 V", "Vcc = 15 V") at the top of the figure is still a
+  source to ground: write it as a V component from that node to "0", unless the rules above say it belongs
+  in "assumptions" instead (op-amp rails, for example).
+
+READING SYMBOLS
+- resistor: zigzag, or a plain rectangle (IEC). capacitor: two parallel plates (one curved = polarised).
+  inductor: a coil or a series of humps. diode: triangle with a bar; a bar bent at both ends = Zener;
+  two arrows pointing away = LED; the bar is the CATHODE, and nodes go [anode, cathode].
+- BJT: a circle (or not) with the emitter arrow. Arrow pointing OUT of the base = NPN, pointing IN = PNP.
+  nodes [collector, base, emitter].
+- MOSFET: gate separated by a gap. Arrow on the bulk pointing IN towards the channel = NMOS, pointing OUT
+  = PMOS. An n-channel source usually sits at the lower-potential side. nodes [drain, gate, source].
+- op-amp: a triangle. The + and − marks tell you which input is which -- read them off the drawing and do
+  NOT assume the + is on top, because op-amps are often drawn flipped. nodes [out, in+, in-].
+- A transformer with a dot in the middle of its secondary is a centre tap; follow the rectifier template.
+
+READING VALUES
+- Copy the value exactly as printed, with its unit prefix: "2k2" means 2.2 kOhm, "4R7" means 4.7 Ohm,
+  "R47" means 0.47 Ohm, "100n" is 100 nF, "1M" is 1 MOhm for a resistor and 1 MHz for a frequency.
+  Greek mu, "u" and "µ" all mean micro.
+- A value you cannot read is NOT a guess: put the component in with a symbol as its value ("R2") and say so
+  in "reading_notes". Do not invent a number, and do not leave the component out.
+- Values written beside a component belong to the component they touch. When a label could belong to either
+  of two parts, say which you chose in "reading_notes".
+
+WHAT THE QUESTION IS
+- If the image contains the question, copy it into "question_text" and build "query" from it as usual.
+- If the image is only a circuit with no question, leave "question_text" as "" and put in "query" the
+  quantities the figure itself points at: a labelled node voltage ("Vo", "Vout" -> V(out)), an arrow for a
+  current, a "?" beside a component. If nothing is marked at all, use the node voltages of the output node
+  and say in "missing_info" that the question was not in the image.
+"""
+
+IMAGE_PARSER_USER = (
+    "This image shows an analog circuit, and may also show the question printed next to it.\n"
+    "Read the schematic and return the JSON object only.\n"
+    "Trace every wire before you write the nodes, and put anything you could not read with confidence in "
+    "\"reading_notes\"."
+)
+
+IMAGE_PARSER_USER_WITH_TEXT = (
+    "This image shows an analog circuit. The question about it is:\n{question}\n\n"
+    "Read the schematic and return the JSON object only. The question text above is authoritative: build "
+    "\"query\" from it. Trace every wire before you write the nodes, and put anything you could not read "
+    "with confidence in \"reading_notes\"."
+)

@@ -34,7 +34,8 @@ from langgraph.types import Command, interrupt
 from classifier import classify
 from conceptual import answer_conceptual
 from explainer import explain
-from llm_client import VelonaClient, load_conventions
+from llm_client import LLMError, VelonaClient, load_conventions
+from parsing.image_parser import parse_image
 from parsing.text_parser import ParseResult, parse_text
 from renderer import describe, render_svg
 from schemas import Netlist, SolveResult
@@ -47,6 +48,7 @@ MAX_SOLVE_RETRIES = 1
 
 class State(TypedDict, total=False):
     question: str
+    image: str                      # path to a schematic image, "" for a text question
     level: str
     hint: str
     netlist: Dict[str, Any]
@@ -79,7 +81,8 @@ class Reply:
 class CircuitAI:
     def __init__(self, client: Optional[VelonaClient] = None, use_llm: bool = True,
                  auto_confirm: bool = False, do_explain: bool = True, do_verify: bool = True,
-                 parse_fn: Optional[Callable[[str, Optional[str]], ParseResult]] = None):
+                 parse_fn: Optional[Callable[[str, Optional[str]], ParseResult]] = None,
+                 image_parse_fn: Optional[Callable[[str, str, Optional[str]], ParseResult]] = None):
         self.client = client if client is not None else (VelonaClient() if use_llm else None)
         self.use_llm = use_llm
         self.auto_confirm = auto_confirm
@@ -88,14 +91,24 @@ class CircuitAI:
         self.conv = load_conventions()
         self.verifier = Verifier() if do_verify else None
         self.parse_fn = parse_fn or (lambda q, hint: parse_text(q, client=self.client, hint=hint))
+        self.image_parse_fn = image_parse_fn or (
+            lambda img, q, hint: parse_image(img, question=q, client=self.client, hint=hint))
         self.graph = self._build()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def ask(self, question: str, level: str = "key", thread_id: Optional[str] = None) -> Reply:
+    def ask(self, question: str = "", level: str = "key", thread_id: Optional[str] = None,
+            image: Optional[str] = None) -> Reply:
+        """question: the text question. image: a path to a schematic image (PNG/JPG/...).
+
+        One or both. With an image, the vision parser reads the circuit off the picture and the question
+        printed on it; a typed question, if given, overrides the printed one. Everything after the parse is
+        identical either way -- same validator, same solver, same ngspice verification."""
+        if not question.strip() and not image:
+            raise ValueError("ask() needs a question, an image, or both")
         tid = thread_id or str(uuid.uuid4())
-        self.graph.invoke({"question": question, "level": level}, self._cfg(tid))
+        self.graph.invoke({"question": question, "level": level, "image": image or ""}, self._cfg(tid))
         return self._reply(tid)
 
     def confirm(self, thread_id: str, ok: bool = True, correction: str = "") -> Reply:
@@ -132,7 +145,15 @@ class CircuitAI:
     # Nodes
     # ------------------------------------------------------------------
     def _parse(self, s: State) -> Dict[str, Any]:
-        pr = self.parse_fn(s["question"], s.get("hint"))
+        image = s.get("image") or ""
+        if image:
+            try:
+                pr = self.image_parse_fn(image, s.get("question", ""), s.get("hint"))
+            except LLMError as e:          # a missing or unreadable file: say so plainly, do not retry
+                return {"status": "parse_failed", "error": str(e), "parse_attempts": 0,
+                        "parse_model": "", "parse_history": [], "parse_raw": {}}
+        else:
+            pr = self.parse_fn(s["question"], s.get("hint"))
         stats = {"parse_attempts": s.get("parse_attempts", 0) + (pr.attempts or 0),   # total over re-parses
                  "parse_model": pr.model_used,
                  "parse_history": list(s.get("parse_history", [])) + list(pr.history or []),
@@ -142,8 +163,13 @@ class CircuitAI:
                     "error": "Could not turn the question into a circuit: " + "; ".join(pr.errors)}
         warnings = list(pr.report.warnings) if pr.report else []
         warnings += [f"Missing information: {m}" for m in pr.missing_info]
-        return {**stats, "netlist": pr.netlist.model_dump(mode="json"), "parse_warnings": warnings,
-                "status": "parsed"}
+        out = {**stats, "netlist": pr.netlist.model_dump(mode="json"), "parse_warnings": warnings,
+               "status": "parsed"}
+        # With an image and nothing typed, the question is whatever was printed on the picture: carry it into
+        # the state so the classifier, the explainer and the confirmation all see it.
+        if image and not (s.get("question") or "").strip():
+            out["question"] = pr.netlist.question or ""
+        return out
 
     def _classify(self, s: State) -> Dict[str, Any]:
         nl = Netlist.model_validate(s["netlist"])

@@ -1,0 +1,17 @@
+{
+ "category": "photo",
+ "question": "",
+ "expect": [
+  {
+   "kind": "IC",
+   "value": 0.00128633,
+   "tol": 0.03
+  },
+  {
+   "kind": "VEC",
+   "value": 7.87087,
+   "tol": 0.03
+  }
+ ],
+ "work": "the mirror of bjt_bias: VBB = 9.895 V, RBB = 8.246k, IB = 12.86 uA, IC = 1.286 mA, VEC = 7.871 V. The emitter is at the TOP and its arrow points IN: a PNP"
+}

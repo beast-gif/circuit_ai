@@ -82,7 +82,11 @@ BARE_NAMES = {"rin": "Rin", "rout": "Rout", "gain": "gain", "av": "gain", "a_v":
               "barkhausen": "barkhausen", "barkhausen_criterion": "barkhausen",
               "gain_condition": "gain_condition", "condition": "gain_condition",
               "gain_required": "gain_condition", "rf": "gain_condition",
-              "oscillates": "oscillates", "will_oscillate": "oscillates"}
+              "oscillates": "oscillates", "will_oscillate": "oscillates",
+              "period": "period", "t": "period", "time_period": "period",
+              "duty": "duty", "duty_cycle": "duty", "duty_ratio": "duty",
+              "t_high": "T_high", "thigh": "T_high", "pulse_width": "T_high",
+              "t_on": "T_high", "t_low": "T_low", "tlow": "T_low", "t_off": "T_low"}
 
 
 @dataclass
@@ -356,6 +360,7 @@ def consistency_errors(question: str, nl: Netlist) -> List[str]:
     errors += _oscillator_errors(question, nl)
     errors += _filter_errors(question, nl)
     errors += _loop_errors(question, nl)
+    errors += _series_source_errors(question, nl)
     errors += _diode_errors(question, nl)
     errors += _bjt_errors(question, nl)
     errors += _mos_errors(question, nl)
@@ -501,16 +506,53 @@ def _comparator_errors(question: str, nl: Netlist) -> List[str]:
 
 
 # ----------------------------------------------------------------------
+# "in series with" checks (Phase 1)
+# ----------------------------------------------------------------------
+_IN_SERIES = re.compile(r"\bin\s+series\s+with\b|\bthrough\s+(?:a\s+)?\w*\s*resistor\b", re.IGNORECASE)
+_LOOP_WORD = re.compile(r"\bloop\b|\bmesh\b", re.IGNORECASE)
+
+
+def _series_source_errors(question: str, nl: Netlist) -> List[str]:
+    """A resistor wired directly ACROSS an ideal voltage source does nothing: the source fixes the voltage,
+    so the resistor carries its own current and changes no other node. When the question says the source is
+    "in series with" that resistor, the resistor belongs BETWEEN the source terminal and the next node, and
+    putting it in parallel silently changes the answer (the rest of the circuit then sees the full source
+    voltage instead of a divided one).
+
+    The exception is a question that says the source and the resistor "form a loop" -- there the parallel
+    wiring is right, and _loop_errors already checks it -- so this test stands down when "loop" is mentioned.
+    """
+    if not _IN_SERIES.search(question) or _LOOP_WORD.search(question):
+        return []
+    errors: List[str] = []
+    for src in [c for c in nl.components if c.type.value == "V"]:
+        pair = set(src.nodes[:2])
+        for r in [c for c in nl.components if c.type.value == "R" and set(c.nodes[:2]) == pair]:
+            other = [c for c in nl.components
+                     if c.id not in (src.id, r.id) and set(c.nodes[:2]) & (pair - {"0"})]
+            if not other:
+                continue                      # nothing else is fed from that node: harmless
+            errors.append(
+                f"{r.id} is wired directly across {src.id} (both on nodes {sorted(pair)}), but the question "
+                f"says they are in series. In parallel, {src.id} fixes that node's voltage and {r.id} has no "
+                f"effect on the rest of the circuit. Put {r.id} BETWEEN the source and the node it feeds: "
+                f"{src.id} on ['n1', '0'] and {r.id} on ['n1', '<the node it feeds>'].")
+    return errors
+
+
+# ----------------------------------------------------------------------
 # Oscillator checks (Phase 4, step 1)
 # ----------------------------------------------------------------------
-_OSC_Q = {"fosc", "barkhausen", "gain_condition", "oscillates"}
+_OSC_Q = {"fosc", "barkhausen", "gain_condition", "oscillates", "period", "duty",
+          "T_high", "T_low"}
 _PHASE_SHIFT = re.compile(r"\bphase[- ]shift\s+oscillator\b|\bRC\s+phase[- ]shift\b", re.IGNORECASE)
 
 
 def _oscillator_errors(question: str, nl: Netlist) -> List[str]:
     ops = [c for c in nl.components if c.type.value == "OPAMP"]
     srcs = [c for c in nl.components if c.type.value in ("V", "I")]
-    if not ops or not (set(nl.query) & _OSC_Q):
+    amps = ops + [c for c in nl.components if c.type.value in ("Q", "M", "E", "G", "F", "H")]
+    if not amps or not (set(nl.query) & _OSC_Q):
         return []
     errors: List[str] = []
     if srcs:
@@ -519,8 +561,24 @@ def _oscillator_errors(question: str, nl: Netlist) -> List[str]:
                       + ". The oscillation comes from the feedback loop itself, and the solver finds it from "
                         "det A(s) = 0, which needs the circuit to be source-free.")
 
+    # an LC oscillator is given as the AC equivalent circuit: the transistor needs gm, not a bias
+    for c in nl.components:
+        if c.type.value in ("Q", "M"):
+            p = {str(k).lower(): v for k, v in (c.params or {}).items()}
+            if not any(p.get(k) for k in ("gm", "g_m", "ic", "i_c", "id", "i_d")):
+                errors.append(f"{c.id} has no gm: an oscillator netlist is the AC equivalent circuit (no "
+                              f"supply), so the transistor is used through its small-signal model. Put gm in "
+                              f'its params, e.g. "params": {{"gm": 0.001}}, or I_C if the question gives the '
+                              f"bias current instead.")
+            if len(c.nodes) >= 3 and c.nodes[2] != "0":
+                errors.append(f"{c.id}: in the AC equivalent circuit of a common-emitter LC oscillator the "
+                              f"emitter is at AC ground, so its third node should be '0', not "
+                              f"'{c.nodes[2]}'.")
+    if not ops:
+        return errors
+
     op = ops[0]
-    out, inp, inm = op.nodes
+    out, inp, inm = op.nodes[:3]
     rs = [c for c in nl.components if c.type.value == "R"]
     cs = [c for c in nl.components if c.type.value == "C"]
     feedback = [c for c in rs if set(c.nodes[:2]) == {out, inm}]
