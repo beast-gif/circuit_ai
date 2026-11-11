@@ -12,8 +12,14 @@ numpy>=1.26
 schemdraw>=0.18
 langgraph>=0.3
 
+# Step 7 (the HTTP API in server.py)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+
 # Step 4 also needs the ngspice PROGRAM (not a pip package):
 #   Windows: download ngspice-XX_64.zip from ngspice.sourceforge.io, extract to C:\Spice64
+#   Linux/Docker: apt-get install -y ngspice  (the Dockerfile does this)
 #   path is set in config.yaml -> solver.ngspice_path
 #
 # Removed: lcapy (replaced by solvers/mna.py), PySpice (ngspice is called directly)

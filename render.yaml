@@ -1,0 +1,19 @@
+# Render blueprint: New + -> Blueprint -> pick this repo.
+#
+# Both values below are marked sync:false, which means Render asks you for them instead of
+# reading them from this file -- the API key must never be in the repo, and the frontend's URL
+# is not known until Vercel has deployed it.
+services:
+  - type: web
+    name: circuit-ai-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore          # the closest free region to India
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: VELONA_API_KEY
+        sync: false            # paste it in the Render dashboard
+      - key: ALLOWED_ORIGINS
+        sync: false            # e.g. https://circuit-ai.vercel.app  (no trailing slash)

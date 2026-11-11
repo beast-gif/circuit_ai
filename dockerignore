@@ -1,0 +1,28 @@
+# the React app is deployed separately (Vercel): it has no business in the API image
+frontend/
+node_modules/
+
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# regenerate these in the container if they are ever needed
+benchmark/images/
+benchmark/results/
+_p5_tmp/
+uploads/
+renders/
+spice_runs/
+*.raw
+*.log
+
+.vscode/
+.idea/
+.DS_Store

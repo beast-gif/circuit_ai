@@ -1,5 +1,10 @@
-# --- Secrets ---
+# ----------------------------------------------------------------------
+# Secrets -- nothing here ever goes to GitHub.
+# The API key is read from VELONA_API_KEY (see .env.example); on a host it is
+# set in that service's environment settings, never in a file in the repo.
+# ----------------------------------------------------------------------
 .env
+.env.*
 *.env
 !.env.example
 
@@ -16,6 +21,7 @@ dist/
 venv/
 .venv/
 env/
+ENV/
 
 # --- Test / tooling caches ---
 .pytest_cache/
@@ -24,20 +30,43 @@ env/
 .coverage
 htmlcov/
 
-# --- ngspice / PySpice output (Step 4) ---
+# --- ngspice working files ---
 *.raw
 *.log
 spice_runs/
 
-# --- Rendered schematics for the confirmation step (Step 6) ---
+# --- Rendered schematics for the confirmation step ---
 renders/
 *.tmp.png
 
-# --- Benchmark results (the problem set itself is kept) ---
+# --- Benchmark output (the problem sets themselves are kept, the results are not) ---
 benchmark/results/
+*.results.json
+out.json
 
-# --- Uploaded question images (Phase 5) ---
+# --- Image benchmark cases: regenerate them with
+#       python benchmark/make_image_cases.py --photos
+#     so they are not worth storing. To keep one of YOUR OWN pictures in the repo
+#     (a textbook screenshot, a photo of your notebook), force it in:
+#       git add -f benchmark/images/my_case.png benchmark/images/my_case.png.json
+# ----------------------------------------------------------------------
+benchmark/images/
+
+# --- Uploads and temporary test files ---
 uploads/
+_p5_tmp/
+
+# ----------------------------------------------------------------------
+# Frontend (Vite + React)
+# ----------------------------------------------------------------------
+node_modules/
+frontend/dist/
+.vite/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # --- Editors / OS ---
 .vscode/

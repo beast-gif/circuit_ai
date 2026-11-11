@@ -28,6 +28,7 @@ from __future__ import annotations
 import cmath
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -120,7 +121,9 @@ class VerifyReport:
 # ngspice
 # ----------------------------------------------------------------------
 def find_ngspice(configured: Optional[str] = None) -> Optional[str]:
-    candidates = [configured, r"C:\Spice64\bin\ngspice_con.exe",
+    # NGSPICE_PATH first so a deployed container can point at its own binary without editing
+    # config.yaml, which still holds the Windows path for local runs.
+    candidates = [os.getenv("NGSPICE_PATH"), configured, r"C:\Spice64\bin\ngspice_con.exe",
                   shutil.which("ngspice_con"), shutil.which("ngspice")]
     for c in candidates:
         if c and Path(c).exists():
