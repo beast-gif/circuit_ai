@@ -56,14 +56,40 @@ UPLOAD_MAX_AGE = 6 * 3600          # an abandoned session's image is deleted aft
 OK_SUFFIX = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 app = FastAPI(title="Analog circuit solver", version="1.0")
+
+# Which browser origins may read a response from this server.
+#
+# A mismatch here is invisible from the server's side -- the request arrives, the answer is
+# computed and sent, and the *browser* then throws the response away. In the app that surfaces
+# as the contact-Amrith dialog with code NET-DOWN, which looks like the server is down when it
+# is not. Two things keep that from happening by accident:
+#
+#   * each entry is stripped of stray spaces and of a trailing slash, because
+#     "https://circuit-ai.vercel.app/" does not match the origin the browser actually sends,
+#     which never has a path;
+#   * every Vercel deployment of this project is allowed by pattern, so the preview URL of a
+#     branch or of an older deployment works as well as the production one. Vercel gives each
+#     deploy its own hostname, and only the production hostname is worth putting in the
+#     environment variable.
+_DEFAULT_ORIGINS = "http://localhost:5173,http://localhost:3000"
+ALLOWED_ORIGINS = [
+    o.strip().rstrip("/")
+    for o in os.getenv("ALLOWED_ORIGINS", _DEFAULT_ORIGINS).split(",")
+    if o.strip()
+]
+# e.g. https://circuit-ai.vercel.app, https://circuit-ai-git-main-amrith.vercel.app
+VERCEL_ORIGINS = r"https://[a-z0-9-]+\.vercel\.app"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000"
-                                        ).split(",") if o],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=VERCEL_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+log.info("CORS allows %s plus *.vercel.app", ALLOWED_ORIGINS)
 
 # One instance for the process: it holds the LangGraph checkpointer, which is what makes a thread_id mean
 # anything. Not auto-confirmed -- the confirmation step is the point of this API.
@@ -202,7 +228,25 @@ def _spice(s: Dict[str, Any]) -> str:
 # ----------------------------------------------------------------------
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True, "version": app.version}
+    # `origins` is here so a CORS problem can be diagnosed from a browser tab in one look:
+    # open /health on the API and check that your site's address is in the list. No secret is
+    # exposed -- these are public addresses, and the key is never read here.
+    return {
+        "ok": True,
+        "version": app.version,
+        "origins": ALLOWED_ORIGINS,
+        "vercel_wildcard": True,
+        "ngspice": bool(_ngspice_present()),
+    }
+
+
+def _ngspice_present() -> bool:
+    """True when the simulator the verification step needs is actually in this container."""
+    try:
+        from verifier import find_ngspice
+        return bool(find_ngspice())
+    except Exception:                                   # never let the health check itself fail
+        return False
 
 
 @app.post("/ask")
